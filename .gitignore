@@ -1,3 +1,13 @@
+# HPU stuff
+hpu_profile/
+hl-smi_log.txt
+*.json
+*.npz
+*.pt
+*.safetensors
+*.tar
+*.tar.gz
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
