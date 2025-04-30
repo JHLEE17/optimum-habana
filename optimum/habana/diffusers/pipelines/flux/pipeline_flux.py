@@ -342,8 +342,151 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
         self.to(self._device)
         if use_hpu_graphs:
             from habana_frameworks.torch.hpu import wrap_in_hpu_graph
+            # transformer = wrap_in_hpu_graph(self.transformer)
+            
+            import torch
+            import torch.nn as nn
+            from para_attn.first_block_cache import utils
 
-            transformer = wrap_in_hpu_graph(transformer)
+            # 1) Precompute wrapper modules for graph capture
+            class BlockSeqFirst(nn.Module):
+                def __init__(self, block):
+                    super().__init__()
+                    self.block = block
+                def forward(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb, joint_attention_kwargs=None):
+                    return self.block(
+                        hidden_states, encoder_hidden_states, temb, image_rotary_emb, joint_attention_kwargs
+                    )
+
+            class BlockSeqRest(nn.Module):
+                def __init__(self, blocks, single_blocks):
+                    super().__init__()
+                    self.blocks = nn.ModuleList(blocks)
+                    self.single_blocks = single_blocks
+                def forward(self, hidden_states, encoder_hidden_states, temb, image_rotary_emb, joint_attention_kwargs=None):
+                    # sequentially apply remaining encoder blocks
+                    for block in self.blocks:
+                        encoder_hidden_states, hidden_states = block(
+                            hidden_states, encoder_hidden_states, temb, image_rotary_emb, joint_attention_kwargs
+                        )
+                    return encoder_hidden_states, hidden_states
+
+            # 2) Create HPU graphs for first block and rest
+            first_block = self.transformer.transformer_blocks[0]
+            rest_blocks = self.transformer.transformer_blocks[1:]
+            single_blocks = self.transformer.single_transformer_blocks
+
+            self.transformer.first_block_graph = wrap_in_hpu_graph(BlockSeqFirst(first_block))
+            self.transformer.rest_blocks_graph = wrap_in_hpu_graph(BlockSeqRest(rest_blocks, single_blocks))
+
+            # 3) Override forward to use graphs and caching
+            original_forward = self.transformer.forward
+
+            def graph_cached_forward(self, hidden_states, encoder_hidden_states=None, pooled_projections=None, timestep=None, img_ids=None, txt_ids=None, guidance=None, joint_attention_kwargs=None, return_dict=False, **kwargs):
+                import habana_frameworks.torch.core as htcore
+                from para_attn.first_block_cache.utils import get_can_use_cache, set_buffer, get_buffer, apply_prev_hidden_states_residual, mark_step_begin
+                
+                # 중요: 원본 입력 형태/크기 저장 (나중에 출력이 같은 형태를 갖도록)
+                original_shape = hidden_states.shape
+                
+                # precompute embeddings (copied from original forward)
+                hidden_states = self.x_embedder(hidden_states)
+                timestep = timestep.to(hidden_states.dtype) * 1000
+                if guidance is None:
+                    temb = self.time_text_embed(timestep, pooled_projections)
+                else:
+                    guidance = guidance.to(hidden_states.dtype) * 1000
+                    temb = self.time_text_embed(timestep, guidance, pooled_projections)
+                encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+                
+                ids = torch.cat((txt_ids, img_ids), dim=0)
+                image_rotary_emb = self.pos_embed(ids)
+                htcore.mark_step()
+
+                # 1) Mark step begin for caching logic
+                mark_step_begin()
+                
+                # 2) Store original hidden states for residual calc
+                original_hidden_states = hidden_states
+                
+                # 3) Run first block through graph
+                encoder_hidden_states_first, hidden_states_first = self.first_block_graph(
+                    hidden_states, encoder_hidden_states, temb, image_rotary_emb, joint_attention_kwargs
+                )
+                htcore.mark_step()
+                
+                # 4) Calculate first block residual
+                first_hidden_states_residual = hidden_states_first - original_hidden_states
+                
+                # 5) Check if cache can be used
+                can_use_cache = get_can_use_cache(
+                    first_hidden_states_residual,
+                    parallelized=getattr(self, "_is_parallelized", False),
+                )
+                htcore.mark_step()
+                # print(f"can_use_cache: {can_use_cache}")
+                
+                # 6) Apply caching logic
+                if can_use_cache:
+                    del first_hidden_states_residual
+                    hidden_states, encoder_hidden_states = apply_prev_hidden_states_residual(
+                        hidden_states_first, encoder_hidden_states_first
+                    )
+                else:
+                    # Store residual for future use
+                    set_buffer("first_hidden_states_residual", first_hidden_states_residual)
+                    del first_hidden_states_residual
+                    
+                    # Run rest of blocks
+                    encoder_hidden_states_rest, hidden_states_rest = self.rest_blocks_graph(
+                        hidden_states_first, encoder_hidden_states_first, temb, image_rotary_emb, joint_attention_kwargs
+                    )
+                    htcore.mark_step()
+                    
+                    # Calculate and store residuals
+                    hidden_states_residual = hidden_states_rest - hidden_states_first
+                    encoder_hidden_states_residual = encoder_hidden_states_rest - encoder_hidden_states_first
+                    
+                    set_buffer("hidden_states_residual", hidden_states_residual)
+                    set_buffer("encoder_hidden_states_residual", encoder_hidden_states_residual)
+                    
+                    hidden_states = hidden_states_rest
+                    encoder_hidden_states = encoder_hidden_states_rest
+                
+                htcore.mark_step()
+                
+                # 7) single_transformer_blocks 처리
+                # 먼저 concatenate
+                hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+                # print(f"Shape after concat: {hidden_states.shape}")
+                
+                # single_transformer_blocks 적용
+                if self.single_transformer_blocks:
+                    for block in self.single_transformer_blocks:
+                        hidden_states = block(hidden_states, temb, image_rotary_emb, joint_attention_kwargs)
+                
+                # 8) 최종 처리: 일단 전체를 슬라이싱
+                hidden_states = hidden_states[:, encoder_hidden_states.shape[1]:, ...]
+                # print(f"Final hidden_states shape: {hidden_states.shape}")
+                
+                # 9) transformer 출력 부분 (norm + proj) 적용
+                hidden_states = self.norm_out(hidden_states, temb)
+                sample = self.proj_out(hidden_states)
+                
+                # 중요: 원본 입력 형태와 같은 크기의 출력 보장
+                assert sample.shape == original_shape, f"Output shape mismatch: {sample.shape} != {original_shape}"
+                
+                htcore.mark_step()
+                
+                if not return_dict:
+                    return (sample,)
+                
+                from diffusers.models.transformers.transformer_flux import Transformer2DModelOutput
+                return Transformer2DModelOutput(sample=sample)
+
+            self.transformer.forward = graph_cached_forward.__get__(self.transformer)
+        else:
+            pass
 
     @classmethod
     def _split_inputs_into_batches(cls, batch_size, latents, prompt_embeds, pooled_prompt_embeds, guidance):
@@ -687,6 +830,7 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
 
             for i in self.progress_bar(range(len(timesteps))):
                 if use_warmup_inference_steps and i == throughput_warmup_steps and j == num_batches - 1:
+                    print(f"Synchronizing at step {i}")
                     ht.hpu.synchronize()
                     t1 = time.time()
 
@@ -728,6 +872,7 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
                 latents_batch = self.scheduler.step(noise_pred, timestep, latents_batch, return_dict=False)[0]
 
                 hb_profiler.step()
+                htcore.mark_step()
                 # htcore.mark_step(sync=True)
                 if num_batches > throughput_warmup_steps:
                     ht.hpu.synchronize()
@@ -741,6 +886,7 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
                 image = latents_batch
 
             outputs["images"].append(image)
+            htcore.mark_step()
             # htcore.mark_step(sync=True)
 
         # 7. Stage after denoising

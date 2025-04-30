@@ -311,6 +311,22 @@ def main():
         default=None,
         help="A lora scale that will be applied to all LoRA layers of the text encoder if LoRA layers are loaded.",
     )
+    parser.add_argument(
+        "--use_fastercache",
+        action="store_true",
+        help="Use FasterCache for generation.",
+    )
+    parser.add_argument(
+        "--use_fbcache",
+        action="store_true",
+        help="Use First Block Cache for generation.",
+    )
+    parser.add_argument(
+        "--rdt",
+        type=float,
+        default=0.2734375,
+        help="Residual Diff Threshold for First Block Cache.",
+    )
     args = parser.parse_args()
 
     if args.optimize and not args.use_habana:
@@ -643,6 +659,27 @@ def main():
             lines = file.readlines()
         lines = [line.strip() for line in lines]
         args.prompts = lines
+
+
+    if args.use_fastercache:
+        print("Using FasterCache")
+        from diffusers import FasterCacheConfig
+        config = FasterCacheConfig(
+            spatial_attention_block_skip_range=2,
+            spatial_attention_timestep_skip_range=(-1, 681),
+            current_timestep_callback=lambda: pipeline.current_timestep,
+            attention_weight_callback=lambda _: 0.3,
+            unconditional_batch_skip_range=5,
+            unconditional_batch_timestep_skip_range=(-1, 781),
+            tensor_format="BFCHW",
+        )
+        pipeline.enable_cache(config)
+        
+    if args.use_fbcache:
+        residual_diff_threshold = args.rdt
+        print(f"Using First Block Cache with residual_diff_threshold = {residual_diff_threshold}")
+        from para_attn.first_block_cache.diffusers_adapters import apply_cache_on_pipe
+        apply_cache_on_pipe(pipeline, residual_diff_threshold=residual_diff_threshold)
 
     # Generate Images using a Stable Diffusion pipeline
     if args.distributed:
