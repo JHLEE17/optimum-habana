@@ -105,6 +105,8 @@ def speed_metrics(
 
     # Compute throughputs
     if num_samples is not None:
+        seconds_per_sample = runtime / num_samples
+        result[f"{split}_seconds_per_sample"] = round(seconds_per_sample, 3)
         samples_per_second = num_samples / runtime
         result[f"{split}_samples_per_second"] = round(samples_per_second, 3)
     if num_steps is not None:
