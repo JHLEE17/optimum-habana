@@ -8,6 +8,9 @@ hl-smi_log.txt
 *.tar
 *.tar.gz
 
+# Gradio
+.gradio/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
