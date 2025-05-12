@@ -20,6 +20,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import numpy as np
 import PIL.Image
 import torch
+import torch.nn as nn
+# from para_attn.first_block_cache import utils
 import torch.nn.functional as F
 from diffusers.models.attention_processor import Attention
 from diffusers.models.autoencoders import AutoencoderKL
@@ -27,6 +29,7 @@ from diffusers.models.transformers import FluxTransformer2DModel
 from diffusers.pipelines.flux.pipeline_flux import FluxPipeline, calculate_shift, retrieve_timesteps
 from diffusers.utils import BaseOutput, replace_example_docstring
 from transformers import CLIPTextModel, CLIPTokenizer, T5EncoderModel, T5TokenizerFast
+from habana_frameworks.torch.hpu import wrap_in_hpu_graph
 
 from optimum.utils import logging
 
@@ -254,6 +257,50 @@ class GaudiFusedFluxAttnProcessor2_0:
             return hidden_states
 
 
+# 개선된 구현: first_block_graph + total_block_graph 접근 방식
+# 1) 첫 번째 블록만 위한 래퍼 모듈 생성
+class FirstBlockWrapper(nn.Module):
+    def __init__(self, transformer):
+        super().__init__()
+        self.first_block = transformer.transformer_blocks[0]
+        self.x_embedder = transformer.x_embedder
+        self.time_text_embed = transformer.time_text_embed
+        self.context_embedder = transformer.context_embedder
+        self.pos_embed = transformer.pos_embed
+    
+    def forward(self, hidden_states, encoder_hidden_states, pooled_projections, timestep, 
+                txt_ids, img_ids, guidance=None, joint_attention_kwargs=None):
+        # 공통 임베딩 처리 (transformer 전처리 단계 포함)
+        hidden_states_embedded = self.x_embedder(hidden_states)
+        timestep = timestep.to(hidden_states_embedded.dtype) * 1000
+        if guidance is None:
+            temb = self.time_text_embed(timestep, pooled_projections)
+        else:
+            guidance = guidance.to(hidden_states_embedded.dtype) * 1000
+            temb = self.time_text_embed(timestep, guidance, pooled_projections)
+        encoder_hidden_states_embedded = self.context_embedder(encoder_hidden_states)
+        
+        ids = torch.cat((txt_ids, img_ids), dim=0)
+        image_rotary_emb = self.pos_embed(ids)
+        
+        # 첫 번째 블록만 실행
+        result = self.first_block(
+            hidden_states_embedded, 
+            encoder_hidden_states_embedded, 
+            temb, 
+            image_rotary_emb, 
+            joint_attention_kwargs
+        )
+        
+        # 결과, 원본 임베딩, 그리고 중간값들 반환
+        return {
+            'result': result,
+            'hidden_states_embedded': hidden_states_embedded,
+            'encoder_hidden_states_embedded': encoder_hidden_states_embedded,
+            'temb': temb,
+            'image_rotary_emb': image_rotary_emb
+        }
+
 class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
     r"""
     Adapted from https://github.com/huggingface/diffusers/blob/v0.30.3/src/diffusers/pipelines/flux/pipeline_flux.py#L140
@@ -341,70 +388,31 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
             block.attn.processor = GaudiFluxAttnProcessor2_0()
 
         self.to(self._device)
-        if use_hpu_graphs and rdt > 0:
-            from habana_frameworks.torch.hpu import wrap_in_hpu_graph
-            import torch
-            import torch.nn as nn
-            from para_attn.first_block_cache import utils
+        self._has_been_quantized = False
 
-            # 개선된 구현: first_block_graph + total_block_graph 접근 방식
-            # 1) 첫 번째 블록만 위한 래퍼 모듈 생성
-            class FirstBlockWrapper(nn.Module):
-                def __init__(self, transformer):
-                    super().__init__()
-                    self.first_block = transformer.transformer_blocks[0]
-                    self.x_embedder = transformer.x_embedder
-                    self.time_text_embed = transformer.time_text_embed
-                    self.context_embedder = transformer.context_embedder
-                    self.pos_embed = transformer.pos_embed
-                
-                def forward(self, hidden_states, encoder_hidden_states, pooled_projections, timestep, 
-                           txt_ids, img_ids, guidance=None, joint_attention_kwargs=None):
-                    # 공통 임베딩 처리 (transformer 전처리 단계 포함)
-                    hidden_states_embedded = self.x_embedder(hidden_states)
-                    timestep = timestep.to(hidden_states_embedded.dtype) * 1000
-                    if guidance is None:
-                        temb = self.time_text_embed(timestep, pooled_projections)
-                    else:
-                        guidance = guidance.to(hidden_states_embedded.dtype) * 1000
-                        temb = self.time_text_embed(timestep, guidance, pooled_projections)
-                    encoder_hidden_states_embedded = self.context_embedder(encoder_hidden_states)
-                    
-                    ids = torch.cat((txt_ids, img_ids), dim=0)
-                    image_rotary_emb = self.pos_embed(ids)
-                    
-                    # 첫 번째 블록만 실행
-                    result = self.first_block(
-                        hidden_states_embedded, 
-                        encoder_hidden_states_embedded, 
-                        temb, 
-                        image_rotary_emb, 
-                        joint_attention_kwargs
-                    )
-                    
-                    # 결과, 원본 임베딩, 그리고 중간값들 반환
-                    return {
-                        'result': result,
-                        'hidden_states_embedded': hidden_states_embedded,
-                        'encoder_hidden_states_embedded': encoder_hidden_states_embedded,
-                        'temb': temb,
-                        'image_rotary_emb': image_rotary_emb
-                    }
+        # Capture pipeline instance for closures
+        pipeline_self = self
+
+        if use_hpu_graphs and rdt > 0:
+            # Import FirstBlockWrapper here if not already globally imported in this file
+            # from .pipeline_flux import FirstBlockWrapper # Assuming it's defined in the same file or accessible
+
+            # FirstBlockWrapper should be created from the original transformer module
+            pipeline_self.first_block_wrapper_for_cache = FirstBlockWrapper(transformer)
+            pipeline_self.first_block_hpu_graph_for_cache = wrap_in_hpu_graph(pipeline_self.first_block_wrapper_for_cache)
             
-            # 2) 그래프 생성
-            # 래퍼 객체 만들기
-            first_block_wrapper = FirstBlockWrapper(transformer)
-            # HPU 그래프로 감싸기
-            first_block_graph = wrap_in_hpu_graph(first_block_wrapper)
-            # 전체 transformer 모델도 HPU 그래프로 감싸기
-            transformer = wrap_in_hpu_graph(transformer)
+            # Wrap the main transformer for HPU graph execution
+            main_transformer_hpu_graph = wrap_in_hpu_graph(transformer)
+            # Capture the original forward method of the HPU-wrapped main transformer
+            # This is the method that will be called if cache is not used for the whole model.
+            original_main_transformer_hpu_graph_forward = main_transformer_hpu_graph.forward
             
             # 3) 전체 모델 그래프 생성 (원래 transformer를 그대로 사용)
-            # 원본 forward 함수를 저장
-            original_forward = transformer.forward
+            # 원본 forward 함수를 저장 (이미 original_main_transformer_hpu_graph_forward 로 저장됨)
 
             # 4) FirstBlockCache + HPU 그래프 통합 forward 함수
-            def graph_cached_forward(self, hidden_states, encoder_hidden_states=None, pooled_projections=None, timestep=None, img_ids=None, txt_ids=None, guidance=None, joint_attention_kwargs=None, return_dict=False, **kwargs):
+            def graph_cached_forward(transformer_instance_self, hidden_states, encoder_hidden_states=None, pooled_projections=None, timestep=None, img_ids=None, txt_ids=None, guidance=None, joint_attention_kwargs=None, return_dict=False, **kwargs):
+                # transformer_instance_self is the main_transformer_hpu_graph instance
                 import habana_frameworks.torch.core as htcore
                 from para_attn.first_block_cache.utils import get_can_use_cache, set_buffer, get_buffer, apply_prev_hidden_states_residual, mark_step_begin
                 
@@ -415,8 +423,8 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
                 mark_step_begin()
                 
                 # 2) first_block_graph 실행 (임베딩 + 첫 번째 블록)
-                # 파이프라인 레벨의 first_block_graph 사용
-                first_block_outputs = first_block_graph(
+                # 파이프라인 레벨의 first_block_graph 사용 (captured pipeline_self)
+                first_block_outputs = pipeline_self.first_block_hpu_graph_for_cache(
                     hidden_states=hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     pooled_projections=pooled_projections,
@@ -444,7 +452,7 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
                 # 4) 캐시 사용 가능 여부 확인
                 can_use_cache = get_can_use_cache(
                     first_hidden_states_residual,
-                    parallelized=getattr(self, "_is_parallelized", False),
+                    parallelized=getattr(transformer_instance_self, "_is_parallelized", False), # Use the HPU graph instance's attribute
                 )
                 htcore.mark_step()
                 # print(f"can_use_cache: {can_use_cache}")
@@ -462,17 +470,21 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
                     del first_hidden_states_residual
                     
                     # 6) 전체 transformer 그래프 실행
-                    # 원본 forward 함수 직접 호출
-                    total_output = original_forward(
-                        hidden_states=hidden_states,
-                        encoder_hidden_states=encoder_hidden_states,
-                        pooled_projections=pooled_projections,
-                        timestep=timestep,
-                        txt_ids=txt_ids,
-                        img_ids=img_ids,
-                        guidance=guidance,
-                        joint_attention_kwargs=joint_attention_kwargs,
-                        return_dict=False,
+                    # 캡처된 original_main_transformer_hpu_graph_forward 호출
+                    # This was the .forward of main_transformer_hpu_graph before it was replaced.
+                    # It's already bound to main_transformer_hpu_graph if it was a method.
+                    # The arguments passed to graph_cached_forward (excluding transformer_instance_self)
+                    # are the ones that original_main_transformer_hpu_graph_forward expects.
+                    total_output = original_main_transformer_hpu_graph_forward(
+                        hidden_states, # Start with actual arguments
+                        encoder_hidden_states,
+                        pooled_projections,
+                        timestep,
+                        img_ids,
+                        txt_ids,
+                        guidance,
+                        joint_attention_kwargs,
+                        return_dict=False, # Match original call signature if it differs
                     )[0]
                 
                 # 결과 저장
@@ -489,13 +501,15 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
                 from diffusers.models.transformers.transformer_flux import Transformer2DModelOutput
                 return Transformer2DModelOutput(sample=total_output)
 
-            # 새 forward 함수 연결
-            transformer.forward = graph_cached_forward.__get__(transformer)
+            # 새 forward 함수 연결 (main_transformer_hpu_graph의 forward를 교체)
+            main_transformer_hpu_graph.forward = graph_cached_forward.__get__(main_transformer_hpu_graph, type(main_transformer_hpu_graph))
+            self.transformer = main_transformer_hpu_graph # Assign the HPU graph wrapped transformer to self.transformer
         elif use_hpu_graphs:
-            from habana_frameworks.torch.hpu import wrap_in_hpu_graph
-            transformer = wrap_in_hpu_graph(transformer)
+            # 'transformer' here is the original nn.Module passed to __init__
+            self.transformer = wrap_in_hpu_graph(transformer)
         else:
-            # Standard init path without HPU graphs
+            # No HPU graphs, self.transformer is the original nn.Module
+            self.transformer = transformer
             pass
 
     @classmethod
@@ -679,13 +693,42 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
             htcore.hpu_set_env()
 
             from neural_compressor.torch.quantization import FP8Config, convert, prepare
-
+            # Ensure FirstBlockWrapper is available in this scope if used for type hinting or direct instantiation
+            from .pipeline_flux import FirstBlockWrapper 
+            # import pdb; pdb.set_trace()
             config = FP8Config.from_json_file(quant_config_path)
+
+            # Determine the base nn.Module for quantization and for FirstBlockWrapper updates
+            # self.transformer could be an HPUGraphWrapper or the raw module
+            base_transformer_module_for_quant = self.transformer.module if hasattr(self.transformer, 'module') and isinstance(self.transformer.module, torch.nn.Module) else self.transformer
+            
             if config.measure:
-                self.transformer = prepare(self.transformer, config)
+                # 'prepare' can modify in-place or return a new object.
+                # If self.transformer was an HPUGraphWrapper, prepare might operate on its .module
+                # and potentially return a new wrapper or the modified module.
+                # We assign the result back to self.transformer.
+                self.transformer = prepare(base_transformer_module_for_quant, config) # Pass the underlying module
+                # After prepare, self.transformer might be the prepared module itself, or a wrapper.
+                # Get the actual prepared module for FirstBlockWrapper
+                current_underlying_module = self.transformer.module if hasattr(self.transformer, 'module') and isinstance(self.transformer.module, torch.nn.Module) else self.transformer
+
+                if hasattr(self, "first_block_wrapper_for_cache"): # Check if cache mechanism is active
+                    self.first_block_wrapper_for_cache = FirstBlockWrapper(current_underlying_module)
+                    # Re-wrap the (potentially observer-injected) FirstBlockWrapper
+                    self.first_block_hpu_graph_for_cache = wrap_in_hpu_graph(self.first_block_wrapper_for_cache)
             elif config.quantize:
-                self.transformer = convert(self.transformer, config)
+                self.transformer = convert(base_transformer_module_for_quant, config) # Pass the underlying module
+                current_underlying_module = self.transformer.module if hasattr(self.transformer, 'module') and isinstance(self.transformer.module, torch.nn.Module) else self.transformer
+
+                if hasattr(self, "first_block_wrapper_for_cache"):
+                    self.first_block_wrapper_for_cache = FirstBlockWrapper(current_underlying_module)
+                    self.first_block_hpu_graph_for_cache = wrap_in_hpu_graph(self.first_block_wrapper_for_cache)
+            
+            # Initialize the main transformer (which might be a module or HPU graph wrapper after prepare/convert)
             htcore.hpu_initialize(self.transformer, mark_only_scales_as_const=True)
+            # No separate htcore.hpu_initialize for first_block_wrapper/graph typically,
+            # as it uses parts of self.transformer which are now initialized.
+            # The wrap_in_hpu_graph for self.first_block_hpu_graph_for_cache handles its HPU setup.
 
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor

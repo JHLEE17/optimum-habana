@@ -4,7 +4,6 @@ import torch
 import gc
 import random
 from PIL import Image # For image concatenation
-# from text_to_image_generation import generate_images # Not strictly needed if run_inference is self-contained
 from optimum.habana.diffusers import GaudiFlowMatchEulerDiscreteScheduler, GaudiFluxPipeline
 from optimum.habana.utils import set_seed # For setting the seed
 
@@ -15,6 +14,8 @@ HEIGHT = 1024
 WIDTH = 1024
 NUM_IMAGES_PER_PROMPT = 1 # Define as a constant for clarity
 BATCH_SIZE = 1 # Define as a constant for clarity
+FP8 = False
+USE_HPU_GRAPHS = True
 RESIZE_IMAGES = False # Option to disable resizing
 
 SAMPLE_PROMPTS = [
@@ -40,13 +41,15 @@ def initialize_pipeline():
         )
         kwargs_pipe = {
             "use_habana": True,
+            "use_hpu_graphs": USE_HPU_GRAPHS,
             "gaudi_config": "Habana/stable-diffusion",
             "sdp_on_bf16": True,
             "scheduler": scheduler_obj,
-            "torch_dtype": torch.bfloat16
+            "torch_dtype": torch.bfloat16,
+            "rdt": RDT
         }
         pipeline = GaudiFluxPipeline.from_pretrained(MODEL_PATH, **kwargs_pipe)
-        if True:  # use_fbcache
+        if RDT > 0:  # use_fbcache
             from para_attn.first_block_cache.diffusers_adapters import apply_cache_on_pipe
             apply_cache_on_pipe(pipeline, residual_diff_threshold=RDT)
     return pipeline
@@ -68,6 +71,7 @@ def run_inference(prompt):
         "height": HEIGHT,
         "width": WIDTH,
         "throughput_warmup_steps": 0,
+        "quant_mode": "quantize" if FP8 else None,
     }
     
     t0 = time.time()
