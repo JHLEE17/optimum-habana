@@ -314,6 +314,7 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
         gaudi_config: Union[str, GaudiConfig] = None,
         bf16_full_eval: bool = False,
         sdp_on_bf16: bool = False,
+        rdt: float = -1.0,
     ):
         GaudiDiffusionPipeline.__init__(
             self,
@@ -340,8 +341,7 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
             block.attn.processor = GaudiFluxAttnProcessor2_0()
 
         self.to(self._device)
-        use_fbcache = False
-        if use_hpu_graphs and use_fbcache:
+        if use_hpu_graphs and rdt > 0:
             from habana_frameworks.torch.hpu import wrap_in_hpu_graph
             import torch
             import torch.nn as nn
@@ -391,17 +391,17 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
                         'image_rotary_emb': image_rotary_emb
                     }
             
-            # 2) 전체 모델 그래프 생성 (원래 transformer를 그대로 사용)
-            # 원본 forward 함수를 저장
-            original_forward = self.transformer.forward
-            
-            # 3) 그래프 생성
+            # 2) 그래프 생성
             # 래퍼 객체 만들기
-            first_block_wrapper = FirstBlockWrapper(self.transformer)
+            first_block_wrapper = FirstBlockWrapper(transformer)
             # HPU 그래프로 감싸기
             first_block_graph = wrap_in_hpu_graph(first_block_wrapper)
             # 전체 transformer 모델도 HPU 그래프로 감싸기
-            total_transformer = wrap_in_hpu_graph(self.transformer)
+            transformer = wrap_in_hpu_graph(transformer)
+            
+            # 3) 전체 모델 그래프 생성 (원래 transformer를 그대로 사용)
+            # 원본 forward 함수를 저장
+            original_forward = transformer.forward
 
             # 4) FirstBlockCache + HPU 그래프 통합 forward 함수
             def graph_cached_forward(self, hidden_states, encoder_hidden_states=None, pooled_projections=None, timestep=None, img_ids=None, txt_ids=None, guidance=None, joint_attention_kwargs=None, return_dict=False, **kwargs):
@@ -490,7 +490,7 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
                 return Transformer2DModelOutput(sample=total_output)
 
             # 새 forward 함수 연결
-            self.transformer.forward = graph_cached_forward.__get__(self.transformer)
+            transformer.forward = graph_cached_forward.__get__(transformer)
         elif use_hpu_graphs:
             from habana_frameworks.torch.hpu import wrap_in_hpu_graph
             transformer = wrap_in_hpu_graph(transformer)
@@ -792,6 +792,7 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
             warmup=profiling_warmup_steps,
             active=profiling_steps,
             record_shapes=False,
+            # with_stack=True,
         )
         hb_profiler.start()
 

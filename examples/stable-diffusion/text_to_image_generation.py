@@ -317,14 +317,9 @@ def main():
         help="Use FasterCache for generation.",
     )
     parser.add_argument(
-        "--use_fbcache",
-        action="store_true",
-        help="Use First Block Cache for generation.",
-    )
-    parser.add_argument(
         "--rdt",
         type=float,
-        default=0.2734375,
+        default=-1.0,
         help="Residual Diff Threshold for First Block Cache.",
     )
     args = parser.parse_args()
@@ -370,6 +365,7 @@ def main():
         "use_hpu_graphs": args.use_hpu_graphs,
         "gaudi_config": args.gaudi_config_name,
         "sdp_on_bf16": args.sdp_on_bf16,
+        "rdt": args.rdt,
     }
 
     if scheduler is not None:
@@ -675,7 +671,7 @@ def main():
         )
         pipeline.enable_cache(config)
         
-    if args.use_fbcache:
+    if args.rdt > 0:
         residual_diff_threshold = args.rdt
         print(f"Using First Block Cache with residual_diff_threshold = {residual_diff_threshold}")
         from para_attn.first_block_cache.diffusers_adapters import apply_cache_on_pipe
