@@ -79,15 +79,6 @@ def inference_worker(prompt, rdt, use_hpu_graphs, seed=None):
     import os
     from pathlib import Path
     
-    # 상수들은 전역 변수에서 가져오지 않고 명시적으로 지정
-    MODEL_PATH = "/workspace/models/FLUX.1-dev"
-    IMG_SAVE_PATH = "/workspace/jh/flux/outputs/gradio"
-    NUM_IMAGES_PER_PROMPT = 1
-    BATCH_SIZE = 1
-    FP8 = False
-    HEIGHT = 1024
-    WIDTH = 1024
-    
     # 파이프라인 캐시 (프로세스별 전역)
     if '_pipeline_cache' not in globals():
         _pipeline_cache = {}
