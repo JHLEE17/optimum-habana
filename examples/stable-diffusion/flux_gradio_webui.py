@@ -273,6 +273,41 @@ custom_css = """
 .gradio-column {
     padding: 10px !important;
 }
+
+/* Seed label styling to align with the input */
+.seed-label {
+    margin: auto 0 !important;
+    padding-right: 5px !important;
+    font-weight: normal !important;
+    white-space: nowrap !important;
+}
+
+/* Make seed input shorter */
+#seed-row input, #seed-row .form {
+    height: 25px !important;
+    min-height: 25px !important;
+    line-height: 25px !important;
+}
+
+#seed-row .form {
+    margin: 0 !important;
+    padding: 0 !important;
+}
+
+#seed-row .block {
+    padding: 0 !important;
+}
+
+/* Make checkbox container smaller */
+#random-seed-checkbox label span:first-of-type {
+    padding: 0 !important;
+    margin-right: 5px !important;
+}
+
+#random-seed-checkbox {
+    width: auto !important;
+    min-width: 0 !important;
+}
 """
 
 # 동물 아이콘 대신 프로그레스 바를 위한 HTML 템플릿
@@ -293,6 +328,343 @@ def create_progress_html(elapsed_seconds=0, is_left=True, progress_speed=5):
         </div>
     </div>
     """
+
+def on_submit_generate(prompt, user_seed=None, use_random_seed=True):
+    loading_msg = "<p style='text-align:center; font-weight:bold;'>⏳ 이미지 생성 중... 잠시만 기다려주세요.</p>"
+    elapsed_offset = 0.3
+    left_progress_speed = 34
+    right_progress_speed = 11
+    start_time = time.time()
+    initial_progress = create_progress_html(0, is_left=True, progress_speed=left_progress_speed)
+    initial_progress_right = create_progress_html(0, is_left=False, progress_speed=right_progress_speed)
+    
+    yield (
+        gr.update(value=loading_msg),                                  
+        gr.update(visible=True, value=initial_progress), 
+        gr.update(visible=False),                          
+        gr.update(value=loading_msg),                                  
+        gr.update(visible=True, value=initial_progress_right),               
+        gr.update(visible=False)                           
+    )
+    
+    if use_random_seed:
+        if SAME_SEED:
+            shared_seed = random.randint(0, 2**32 - 1)
+        else:
+            shared_seed = None
+    else:
+        try:
+            # Convert to integer and ensure it's within allowed range
+            shared_seed = int(user_seed)
+            if shared_seed < 0 or shared_seed > 2**32 - 1:
+                shared_seed = random.randint(0, 2**32 - 1)
+                print(f"Seed out of range, using random seed instead: {shared_seed}")
+        except (ValueError, TypeError):
+            shared_seed = random.randint(0, 2**32 - 1)
+            print(f"Invalid seed input, using random seed instead: {shared_seed}")
+    
+    if ENABLE_DUAL_PROCESS:
+        # ProcessPoolExecutor를 사용한 병렬 추론
+        left_future = _executor.submit(inference_worker, prompt, RDT, USE_HPU_GRAPHS, shared_seed)
+        right_future = _executor.submit(inference_worker, prompt, 0.0, USE_HPU_GRAPHS, shared_seed)
+        done_left = False
+        done_right = False
+        current_left_time_html = loading_msg
+        current_left_progress_visible = True
+        current_left_image_visible = False
+        current_left_image_value = None
+        current_right_time_html = loading_msg
+        current_right_progress_visible = True
+        current_right_image_visible = False
+        current_right_image_value = None
+        
+        # 프로그레스 바 업데이트 간격 (초)
+        update_interval = 0.5
+        last_update = time.time()
+        
+        while not (done_left and done_right):
+            current_time = time.time()
+            elapsed = current_time - start_time
+            
+            # 주기적으로 프로그레스 바 업데이트
+            if current_time - last_update >= update_interval:
+                last_update = current_time
+                left_progress_html = create_progress_html(elapsed-elapsed_offset, is_left=True, progress_speed=left_progress_speed)
+                right_progress_html = create_progress_html(elapsed-elapsed_offset, is_left=False, progress_speed=right_progress_speed)
+                
+                yield (
+                    gr.update(value=current_left_time_html),
+                    gr.update(visible=current_left_progress_visible, value=left_progress_html),
+                    gr.update(visible=current_left_image_visible, value=current_left_image_value),
+                    gr.update(value=current_right_time_html),
+                    gr.update(visible=current_right_progress_visible, value=right_progress_html),
+                    gr.update(visible=current_right_image_visible, value=current_right_image_value)
+                )
+            
+            # Future 상태 확인
+            done, _ = wait([left_future, right_future], timeout=0.1, return_when=FIRST_COMPLETED)
+            
+            # 왼쪽 이미지 처리
+            if left_future in done and not done_left:
+                try:
+                    images_l, elapsed_l, seed_l = left_future.result()
+                    display_image_left = None
+                    if NUM_IMAGES_PER_PROMPT == 4 and isinstance(images_l, list) and len(images_l) == 4:
+                        concatenated_image_l = concat_images_grid(images_l)
+                        if concatenated_image_l:
+                            display_image_left = concatenated_image_l
+                    elif isinstance(images_l, list) and len(images_l) > 0:
+                        display_image_left = images_l[0]
+                    else:
+                        display_image_left = images_l
+                    current_left_time_html = f"""
+                    <div style='padding:15px; background-color:#333333; color:white; border-radius:5px; font-size:1.2em;'>
+                        <p><b>1 image</b> is generated in <b>{elapsed_l-0.1:.2f} seconds</b></p>
+                    </div>
+                    """
+                    current_left_progress_visible = False
+                    current_left_image_visible = True
+                    current_left_image_value = display_image_left
+                except Exception as e:
+                    current_left_time_html = f"<p style='color:red; text-align:center;'>Left job failed: {e}</p>"
+                    current_left_progress_visible = False
+                    current_left_image_visible = False
+                done_left = True
+                
+                # 왼쪽 이미지 완료 시 UI 업데이트
+                yield (
+                    gr.update(value=current_left_time_html),
+                    gr.update(visible=current_left_progress_visible, value=create_progress_html(elapsed-elapsed_offset, is_left=True, progress_speed=left_progress_speed)),
+                    gr.update(visible=current_left_image_visible, value=current_left_image_value),
+                    gr.update(value=current_right_time_html),
+                    gr.update(visible=current_right_progress_visible, value=create_progress_html(elapsed-elapsed_offset, is_left=False, progress_speed=right_progress_speed)),
+                    gr.update(visible=current_right_image_visible, value=current_right_image_value)
+                )
+            
+            # 오른쪽 이미지 처리
+            if right_future in done and not done_right:
+                try:
+                    images_r, elapsed_r, seed_r = right_future.result()
+                    display_image_right = None
+                    if NUM_IMAGES_PER_PROMPT == 4 and isinstance(images_r, list) and len(images_r) == 4:
+                        concatenated_image_r = concat_images_grid(images_r)
+                        if concatenated_image_r:
+                            display_image_right = concatenated_image_r
+                    elif isinstance(images_r, list) and len(images_r) > 0:
+                        display_image_right = images_r[0]
+                    else:
+                        display_image_right = images_r
+                    current_right_time_html = f"""
+                    <div style='padding:15px; background-color:#333333; color:white; border-radius:5px; font-size:1.2em;'>
+                        <p><b>1 image</b> is generated in <b>{elapsed_r-0.1:.2f} seconds</b></p>
+                    </div>
+                    """
+                    current_right_progress_visible = False
+                    current_right_image_visible = True
+                    current_right_image_value = display_image_right
+                except Exception as e:
+                    current_right_time_html = f"<p style='color:red; text-align:center;'>Right job failed: {e}</p>"
+                    current_right_progress_visible = False
+                    current_right_image_visible = False
+                done_right = True
+                
+                # 오른쪽 이미지 완료 시 UI 업데이트
+                yield (
+                    gr.update(value=current_left_time_html),
+                    gr.update(visible=current_left_progress_visible, value=create_progress_html(elapsed-elapsed_offset, is_left=True, progress_speed=left_progress_speed)),
+                    gr.update(visible=current_left_image_visible, value=current_left_image_value),
+                    gr.update(value=current_right_time_html),
+                    gr.update(visible=current_right_progress_visible, value=create_progress_html(elapsed-elapsed_offset, is_left=False, progress_speed=right_progress_speed)),
+                    gr.update(visible=current_right_image_visible, value=current_right_image_value)
+                )
+    else:
+        # 간단히 왼쪽에 이미지를 생성하고 오른쪽에는 지연 효과를 줍니다
+        try:
+            # 왼쪽 이미지 생성 (SqueezeBits 모델)
+            pipe = initialize_pipeline(rdt=RDT, use_hpu_graphs=USE_HPU_GRAPHS)
+            if shared_seed is None:
+                current_seed = random.randint(0, 2**32 - 1)
+            else:
+                current_seed = shared_seed
+            
+            set_seed(current_seed)
+            print(f"Using seed for this run: {current_seed}")
+            
+            kwargs_call = {
+                "prompt": prompt,
+                "num_images_per_prompt": NUM_IMAGES_PER_PROMPT,
+                "batch_size": BATCH_SIZE,
+                "num_inference_steps": 28,
+                "output_type": "pil",
+                "height": HEIGHT,
+                "width": WIDTH,
+                "throughput_warmup_steps": 0,
+                "quant_mode": "quantize" if FP8 else None,
+            }
+            
+            # 프로그레스 바 업데이트 시작
+            update_interval = 0.5
+            last_update = time.time()
+            
+            # 비동기 방식으로 프로그레스 바 업데이트하기 위한 프로세스 시작
+            inference_start = time.time()
+            
+            # 추론 시작
+            t0 = time.time()
+            
+            # 추론 중 프로그레스 바 업데이트 (28개 스텝 가정)
+            for step in range(1, 29):
+                current_time = time.time()
+                elapsed = current_time - start_time
+                if current_time - last_update >= update_interval:
+                    last_update = current_time
+                    step_progress = min(95, (step / 28) * 100)  # 최대 95%까지만 표시
+                    bar_width = step_progress
+                    
+                    left_progress_html = f"""
+                    <div style="width:100%; margin:10px 0; text-align:center;">
+                        <p style="margin-bottom:5px; font-weight:bold;">이미지 생성 중... {elapsed:.1f}초 경과 (스텝 {step}/28)</p>
+                        <div style="width:100%; background-color:#ddd; border-radius:4px; overflow:hidden;">
+                            <div style="height:24px; width:{bar_width}%; background-color:#4CAF50; 
+                                 text-align:center; line-height:24px; color:white; transition:width 0.3s;">
+                                {bar_width:.0f}%
+                            </div>
+                        </div>
+                    </div>
+                    """
+                    
+                    right_progress_html = create_progress_html(elapsed-elapsed_offset, is_left=False, progress_speed=right_progress_speed)
+                    
+                    yield (
+                        gr.update(value=loading_msg),
+                        gr.update(visible=True, value=left_progress_html),
+                        gr.update(visible=False),
+                        gr.update(value="<p style='text-align:center; font-weight:bold; font-size:1.2em;'>⏳ Will be displayed soon...</p>"),
+                        gr.update(visible=True, value=right_progress_html),
+                        gr.update(visible=False)
+                    )
+                
+                # 실제 inference가 없으므로 약간의 딜레이만 추가
+                time.sleep(0.05)
+            
+            # 실제 inference 실행
+            outputs = pipe(**kwargs_call)
+            t1 = time.time()
+            
+            images = outputs.images if hasattr(outputs, "images") else outputs["images"]
+            elapsed = t1 - t0
+            
+            # 이미지 저장
+            if IMG_SAVE_PATH is not None:
+                import os
+                from pathlib import Path
+                image_save_dir = Path(IMG_SAVE_PATH)
+                image_save_dir.mkdir(parents=True, exist_ok=True)
+                timestamp = int(time.time())
+                if not isinstance(images, list):
+                    images_list = [images]
+                else:
+                    images_list = images
+                for i, image in enumerate(images_list):
+                    try:
+                        image.save(image_save_dir / f"image_{timestamp}_{current_seed}_{i + 1}.png")
+                    except AttributeError:
+                        print(f"Warning: Could not save image {i+1} as it might not be a PIL image.")
+            
+            # 이미지 처리
+            display_image = None
+            if NUM_IMAGES_PER_PROMPT == 4 and isinstance(images, list) and len(images) == 4:
+                concatenated_image = concat_images_grid(images)
+                if concatenated_image:
+                    display_image = concatenated_image
+            elif isinstance(images, list) and len(images) > 0:
+                display_image = images[0]
+            else:
+                display_image = images
+            
+            # 파이프라인 캐시를 유지하기 위해 메모리 정리 코드 제거
+            # 필요한 경우에만 부분적으로 메모리 정리
+            gc.collect()
+            
+            left_time_html = f"""
+            <div style='padding:15px; background-color:#333333; color:white; border-radius:5px; font-size:1.2em;'>
+                <p><b>1 image</b> is generated in <b>{elapsed:.2f} seconds</b></p>
+            </div>
+            """
+            
+            # 왼쪽 이미지 표시 및 오른쪽 로딩 표시
+            total_elapsed = time.time() - start_time
+            right_progress_html = create_progress_html(total_elapsed-elapsed_offset, is_left=False, progress_speed=right_progress_speed)
+            
+            yield (
+                gr.update(value=left_time_html),
+                gr.update(visible=False),
+                gr.update(visible=True, value=display_image),
+                gr.update(value="<p style='text-align:center; font-weight:bold; font-size:1.2em;'>⏳ Will be displayed soon...</p>"),
+                gr.update(visible=True, value=right_progress_html),
+                gr.update(visible=False)
+            )
+            
+            # 오른쪽에 지연 효과 부여 (동일한 이미지)
+            delay_time = random.uniform(3.0, 5.0)
+            delay_start = time.time()
+            
+            # 지연 시간 동안 프로그레스 바 업데이트
+            while time.time() - delay_start < delay_time:
+                current_time = time.time()
+                delay_elapsed = current_time - delay_start
+                total_elapsed = current_time - start_time
+                progress_percent = (delay_elapsed / delay_time) * 100
+                
+                right_progress_html = f"""
+                <div style="width:100%; margin:10px 0; text-align:center;">
+                    <p style="margin-bottom:5px; font-weight:bold;">다른 API 서비스 대기 중... {total_elapsed:.1f}초 경과</p>
+                    <div style="width:100%; background-color:#ddd; border-radius:4px; overflow:hidden;">
+                        <div style="height:24px; width:{progress_percent}%; background-color:#FFA726; 
+                             text-align:center; line-height:24px; color:white; transition:width 0.3s;">
+                            {progress_percent:.0f}%
+                        </div>
+                    </div>
+                </div>
+                """
+                
+                yield (
+                    gr.update(value=left_time_html),
+                    gr.update(visible=False),
+                    gr.update(visible=True, value=display_image),
+                    gr.update(value="<p style='text-align:center; font-weight:bold; font-size:1.2em;'>⏳ Will be displayed soon...</p>"),
+                    gr.update(visible=True, value=right_progress_html),
+                    gr.update(visible=False)
+                )
+                
+                time.sleep(0.1)
+            
+            right_time_html = f"""
+            <div style='padding:15px; background-color:#333333; color:white; border-radius:5px; font-size:1.2em;'>
+                <p><b>1 image</b> is generated in <b>{elapsed + delay_time:.2f} seconds</b> </p>
+            </div>
+            """
+            
+            # 최종 결과 (오른쪽에도 동일한 이미지 표시)
+            yield (
+                gr.update(value=left_time_html),
+                gr.update(visible=False),
+                gr.update(visible=True, value=display_image),
+                gr.update(value=right_time_html),
+                gr.update(visible=False),
+                gr.update(visible=True, value=display_image)
+            )
+            
+        except Exception as e:
+            error_html = f"<p style='color:red; text-align:center;'>Error: {str(e)}</p>"
+            yield (
+                gr.update(value=error_html),
+                gr.update(visible=False),
+                gr.update(visible=False),
+                gr.update(value=error_html),
+                gr.update(visible=False),
+                gr.update(visible=False)
+            )
 
 with gr.Blocks(title="Flux Image Generation UI", css=custom_css) as demo:
     # Main title at the top
@@ -341,351 +713,46 @@ with gr.Blocks(title="Flux Image Generation UI", css=custom_css) as demo:
     
     # Move prompt area here - immediately after the galleries
     prompt_box = gr.Textbox(label="Prompt", placeholder="Enter your prompt here", lines=2)
-    
+
     with gr.Row():
-        sample_prompt_btn = gr.Button("Use Sample Prompt")
-        submit_btn = gr.Button("Generate", variant="primary")
-
-    cheetah_icon_html = "<div style='font-size:50px; text-align:center;'>🐆</div>"
-    turtle_icon_html = "<div style='font-size:50px; text-align:center;'>🐢</div>"
-
-    def on_submit_generate(prompt):
-        loading_msg = "<p style='text-align:center; font-weight:bold;'>⏳ 이미지 생성 중... 잠시만 기다려주세요.</p>"
-        elapsed_offset = 0.2
-        left_progress_speed = 35
-        right_progress_speed = 12
-        start_time = time.time()
-        initial_progress = create_progress_html(0, is_left=True, progress_speed=left_progress_speed)
-        initial_progress_right = create_progress_html(0, is_left=False, progress_speed=right_progress_speed)
-        
-        yield (
-            gr.update(value=loading_msg),                                  
-            gr.update(visible=True, value=initial_progress), 
-            gr.update(visible=False),                          
-            gr.update(value=loading_msg),                                  
-            gr.update(visible=True, value=initial_progress_right),               
-            gr.update(visible=False)                           
-        )
-        
-        if SAME_SEED:
-            shared_seed = random.randint(0, 2**32 - 1)
-        else:
-            shared_seed = None
-            
-        if ENABLE_DUAL_PROCESS:
-            # ProcessPoolExecutor를 사용한 병렬 추론
-            left_future = _executor.submit(inference_worker, prompt, RDT, USE_HPU_GRAPHS, shared_seed)
-            right_future = _executor.submit(inference_worker, prompt, 0.0, USE_HPU_GRAPHS, shared_seed)
-            done_left = False
-            done_right = False
-            current_left_time_html = loading_msg
-            current_left_progress_visible = True
-            current_left_image_visible = False
-            current_left_image_value = None
-            current_right_time_html = loading_msg
-            current_right_progress_visible = True
-            current_right_image_visible = False
-            current_right_image_value = None
-            
-            # 프로그레스 바 업데이트 간격 (초)
-            update_interval = 0.5
-            last_update = time.time()
-            
-            while not (done_left and done_right):
-                current_time = time.time()
-                elapsed = current_time - start_time
-                
-                # 주기적으로 프로그레스 바 업데이트
-                if current_time - last_update >= update_interval:
-                    last_update = current_time
-                    left_progress_html = create_progress_html(elapsed-elapsed_offset, is_left=True, progress_speed=left_progress_speed)
-                    right_progress_html = create_progress_html(elapsed-elapsed_offset, is_left=False, progress_speed=right_progress_speed)
-                    
-                    yield (
-                        gr.update(value=current_left_time_html),
-                        gr.update(visible=current_left_progress_visible, value=left_progress_html),
-                        gr.update(visible=current_left_image_visible, value=current_left_image_value),
-                        gr.update(value=current_right_time_html),
-                        gr.update(visible=current_right_progress_visible, value=right_progress_html),
-                        gr.update(visible=current_right_image_visible, value=current_right_image_value)
-                    )
-                
-                # Future 상태 확인
-                done, _ = wait([left_future, right_future], timeout=0.1, return_when=FIRST_COMPLETED)
-                
-                # 왼쪽 이미지 처리
-                if left_future in done and not done_left:
-                    try:
-                        images_l, elapsed_l, seed_l = left_future.result()
-                        display_image_left = None
-                        if NUM_IMAGES_PER_PROMPT == 4 and isinstance(images_l, list) and len(images_l) == 4:
-                            concatenated_image_l = concat_images_grid(images_l)
-                            if concatenated_image_l:
-                                display_image_left = concatenated_image_l
-                        elif isinstance(images_l, list) and len(images_l) > 0:
-                            display_image_left = images_l[0]
-                        else:
-                            display_image_left = images_l
-                        current_left_time_html = f"""
-                        <div style='padding:15px; background-color:#333333; color:white; border-radius:5px; font-size:1.2em;'>
-                            <p><b>1 image</b> is generated in <b>{elapsed_l-0.1:.2f} seconds</b></p>
-                        </div>
-                        """
-                        current_left_progress_visible = False
-                        current_left_image_visible = True
-                        current_left_image_value = display_image_left
-                    except Exception as e:
-                        current_left_time_html = f"<p style='color:red; text-align:center;'>Left job failed: {e}</p>"
-                        current_left_progress_visible = False
-                        current_left_image_visible = False
-                    done_left = True
-                    
-                    # 왼쪽 이미지 완료 시 UI 업데이트
-                    yield (
-                        gr.update(value=current_left_time_html),
-                        gr.update(visible=current_left_progress_visible, value=create_progress_html(elapsed-elapsed_offset, is_left=True, progress_speed=left_progress_speed)),
-                        gr.update(visible=current_left_image_visible, value=current_left_image_value),
-                        gr.update(value=current_right_time_html),
-                        gr.update(visible=current_right_progress_visible, value=create_progress_html(elapsed-elapsed_offset, is_left=False, progress_speed=right_progress_speed)),
-                        gr.update(visible=current_right_image_visible, value=current_right_image_value)
-                    )
-                
-                # 오른쪽 이미지 처리
-                if right_future in done and not done_right:
-                    try:
-                        images_r, elapsed_r, seed_r = right_future.result()
-                        display_image_right = None
-                        if NUM_IMAGES_PER_PROMPT == 4 and isinstance(images_r, list) and len(images_r) == 4:
-                            concatenated_image_r = concat_images_grid(images_r)
-                            if concatenated_image_r:
-                                display_image_right = concatenated_image_r
-                        elif isinstance(images_r, list) and len(images_r) > 0:
-                            display_image_right = images_r[0]
-                        else:
-                            display_image_right = images_r
-                        current_right_time_html = f"""
-                        <div style='padding:15px; background-color:#333333; color:white; border-radius:5px; font-size:1.2em;'>
-                            <p><b>1 image</b> is generated in <b>{elapsed_r-0.1:.2f} seconds</b></p>
-                        </div>
-                        """
-                        current_right_progress_visible = False
-                        current_right_image_visible = True
-                        current_right_image_value = display_image_right
-                    except Exception as e:
-                        current_right_time_html = f"<p style='color:red; text-align:center;'>Right job failed: {e}</p>"
-                        current_right_progress_visible = False
-                        current_right_image_visible = False
-                    done_right = True
-                    
-                    # 오른쪽 이미지 완료 시 UI 업데이트
-                    yield (
-                        gr.update(value=current_left_time_html),
-                        gr.update(visible=current_left_progress_visible, value=create_progress_html(elapsed-elapsed_offset, is_left=True, progress_speed=left_progress_speed)),
-                        gr.update(visible=current_left_image_visible, value=current_left_image_value),
-                        gr.update(value=current_right_time_html),
-                        gr.update(visible=current_right_progress_visible, value=create_progress_html(elapsed-elapsed_offset, is_left=False, progress_speed=right_progress_speed)),
-                        gr.update(visible=current_right_image_visible, value=current_right_image_value)
-                    )
-        else:
-            # 간단히 왼쪽에 이미지를 생성하고 오른쪽에는 지연 효과를 줍니다
-            try:
-                # 왼쪽 이미지 생성 (SqueezeBits 모델)
-                pipe = initialize_pipeline(rdt=RDT, use_hpu_graphs=USE_HPU_GRAPHS)
-                if shared_seed is None:
-                    current_seed = random.randint(0, 2**32 - 1)
-                else:
-                    current_seed = shared_seed
-                
-                set_seed(current_seed)
-                print(f"Using seed for this run: {current_seed}")
-                
-                kwargs_call = {
-                    "prompt": prompt,
-                    "num_images_per_prompt": NUM_IMAGES_PER_PROMPT,
-                    "batch_size": BATCH_SIZE,
-                    "num_inference_steps": 28,
-                    "output_type": "pil",
-                    "height": HEIGHT,
-                    "width": WIDTH,
-                    "throughput_warmup_steps": 0,
-                    "quant_mode": "quantize" if FP8 else None,
-                }
-                
-                # 프로그레스 바 업데이트 시작
-                update_interval = 0.5
-                last_update = time.time()
-                
-                # 비동기 방식으로 프로그레스 바 업데이트하기 위한 프로세스 시작
-                inference_start = time.time()
-                
-                # 추론 시작
-                t0 = time.time()
-                
-                # 추론 중 프로그레스 바 업데이트 (28개 스텝 가정)
-                for step in range(1, 29):
-                    current_time = time.time()
-                    elapsed = current_time - start_time
-                    if current_time - last_update >= update_interval:
-                        last_update = current_time
-                        step_progress = min(95, (step / 28) * 100)  # 최대 95%까지만 표시
-                        bar_width = step_progress
-                        
-                        left_progress_html = f"""
-                        <div style="width:100%; margin:10px 0; text-align:center;">
-                            <p style="margin-bottom:5px; font-weight:bold;">이미지 생성 중... {elapsed:.1f}초 경과 (스텝 {step}/28)</p>
-                            <div style="width:100%; background-color:#ddd; border-radius:4px; overflow:hidden;">
-                                <div style="height:24px; width:{bar_width}%; background-color:#4CAF50; 
-                                     text-align:center; line-height:24px; color:white; transition:width 0.3s;">
-                                    {bar_width:.0f}%
-                                </div>
-                            </div>
-                        </div>
-                        """
-                        
-                        right_progress_html = create_progress_html(elapsed-elapsed_offset, is_left=False, progress_speed=right_progress_speed)
-                        
-                        yield (
-                            gr.update(value=loading_msg),
-                            gr.update(visible=True, value=left_progress_html),
-                            gr.update(visible=False),
-                            gr.update(value="<p style='text-align:center; font-weight:bold; font-size:1.2em;'>⏳ Will be displayed soon...</p>"),
-                            gr.update(visible=True, value=right_progress_html),
-                            gr.update(visible=False)
-                        )
-                    
-                    # 실제 inference가 없으므로 약간의 딜레이만 추가
-                    time.sleep(0.05)
-                
-                # 실제 inference 실행
-                outputs = pipe(**kwargs_call)
-                t1 = time.time()
-                
-                images = outputs.images if hasattr(outputs, "images") else outputs["images"]
-                elapsed = t1 - t0
-                
-                # 이미지 저장
-                if IMG_SAVE_PATH is not None:
-                    import os
-                    from pathlib import Path
-                    image_save_dir = Path(IMG_SAVE_PATH)
-                    image_save_dir.mkdir(parents=True, exist_ok=True)
-                    timestamp = int(time.time())
-                    if not isinstance(images, list):
-                        images_list = [images]
-                    else:
-                        images_list = images
-                    for i, image in enumerate(images_list):
-                        try:
-                            image.save(image_save_dir / f"image_{timestamp}_{current_seed}_{i + 1}.png")
-                        except AttributeError:
-                            print(f"Warning: Could not save image {i+1} as it might not be a PIL image.")
-                
-                # 이미지 처리
-                display_image = None
-                if NUM_IMAGES_PER_PROMPT == 4 and isinstance(images, list) and len(images) == 4:
-                    concatenated_image = concat_images_grid(images)
-                    if concatenated_image:
-                        display_image = concatenated_image
-                elif isinstance(images, list) and len(images) > 0:
-                    display_image = images[0]
-                else:
-                    display_image = images
-                
-                # 파이프라인 캐시를 유지하기 위해 메모리 정리 코드 제거
-                # 필요한 경우에만 부분적으로 메모리 정리
-                gc.collect()
-                
-                left_time_html = f"""
-                <div style='padding:15px; background-color:#333333; color:white; border-radius:5px; font-size:1.2em;'>
-                    <p><b>1 image</b> is generated in <b>{elapsed:.2f} seconds</b></p>
-                </div>
-                """
-                
-                # 왼쪽 이미지 표시 및 오른쪽 로딩 표시
-                total_elapsed = time.time() - start_time
-                right_progress_html = create_progress_html(total_elapsed-elapsed_offset, is_left=False, progress_speed=right_progress_speed)
-                
-                yield (
-                    gr.update(value=left_time_html),
-                    gr.update(visible=False),
-                    gr.update(visible=True, value=display_image),
-                    gr.update(value="<p style='text-align:center; font-weight:bold; font-size:1.2em;'>⏳ Will be displayed soon...</p>"),
-                    gr.update(visible=True, value=right_progress_html),
-                    gr.update(visible=False)
+        with gr.Column(scale=2.5, elem_id="random-seed-checkbox"):
+            seed_checkbox = gr.Checkbox(label="Use Random Seed", value=True)
+        with gr.Column(scale=3.5):
+            # Replace standard Number component with a Row containing Text and Number
+            with gr.Row(elem_id="seed-row"):
+                gr.Markdown("Seed(0 to 4294967295):", elem_classes=["seed-label"])
+                seed_input = gr.Number(
+                    label="", 
+                    value=42, 
+                    minimum=0, 
+                    maximum=2**32-1, 
+                    step=1, 
+                    precision=0, 
+                    interactive=True,  # Make it interactive by default and let the toggle function handle it
+                    container=False
                 )
-                
-                # 오른쪽에 지연 효과 부여 (동일한 이미지)
-                delay_time = random.uniform(3.0, 5.0)
-                delay_start = time.time()
-                
-                # 지연 시간 동안 프로그레스 바 업데이트
-                while time.time() - delay_start < delay_time:
-                    current_time = time.time()
-                    delay_elapsed = current_time - delay_start
-                    total_elapsed = current_time - start_time
-                    progress_percent = (delay_elapsed / delay_time) * 100
-                    
-                    right_progress_html = f"""
-                    <div style="width:100%; margin:10px 0; text-align:center;">
-                        <p style="margin-bottom:5px; font-weight:bold;">다른 API 서비스 대기 중... {total_elapsed:.1f}초 경과</p>
-                        <div style="width:100%; background-color:#ddd; border-radius:4px; overflow:hidden;">
-                            <div style="height:24px; width:{progress_percent}%; background-color:#FFA726; 
-                                 text-align:center; line-height:24px; color:white; transition:width 0.3s;">
-                                {progress_percent:.0f}%
-                            </div>
-                        </div>
-                    </div>
-                    """
-                    
-                    yield (
-                        gr.update(value=left_time_html),
-                        gr.update(visible=False),
-                        gr.update(visible=True, value=display_image),
-                        gr.update(value="<p style='text-align:center; font-weight:bold; font-size:1.2em;'>⏳ Will be displayed soon...</p>"),
-                        gr.update(visible=True, value=right_progress_html),
-                        gr.update(visible=False)
-                    )
-                    
-                    time.sleep(0.1)
-                
-                right_time_html = f"""
-                <div style='padding:15px; background-color:#333333; color:white; border-radius:5px; font-size:1.2em;'>
-                    <p><b>1 image</b> is generated in <b>{elapsed + delay_time:.2f} seconds</b> </p>
-                </div>
-                """
-                
-                # 최종 결과 (오른쪽에도 동일한 이미지 표시)
-                yield (
-                    gr.update(value=left_time_html),
-                    gr.update(visible=False),
-                    gr.update(visible=True, value=display_image),
-                    gr.update(value=right_time_html),
-                    gr.update(visible=False),
-                    gr.update(visible=True, value=display_image)
-                )
-                
-            except Exception as e:
-                error_html = f"<p style='color:red; text-align:center;'>Error: {str(e)}</p>"
-                yield (
-                    gr.update(value=error_html),
-                    gr.update(visible=False),
-                    gr.update(visible=False),
-                    gr.update(value=error_html),
-                    gr.update(visible=False),
-                    gr.update(visible=False)
-                )
+        with gr.Column(scale=4):
+            sample_prompt_btn = gr.Button("Use Sample Prompt")
+        with gr.Column(scale=4):
+            submit_btn = gr.Button("Generate", variant="primary")
 
+    # Update seed input interactivity based on checkbox
+    def toggle_seed_input(use_random):
+        return gr.update(interactive=not use_random)
+    
+    seed_checkbox.change(fn=toggle_seed_input, inputs=[seed_checkbox], outputs=[seed_input])
+    
     def on_click_sample_prompt():
         return gr.update(value=random.choice(SAMPLE_PROMPTS))
 
     submit_btn.click(
         on_submit_generate,
-        inputs=prompt_box,
+        inputs=[prompt_box, seed_input, seed_checkbox],
         outputs=[left_time, left_progress_display, left_image, right_time, right_progress_display, right_image],
     )
     prompt_box.submit(
         on_submit_generate,
-        inputs=prompt_box,
+        inputs=[prompt_box, seed_input, seed_checkbox],
         outputs=[left_time, left_progress_display, left_image, right_time, right_progress_display, right_image],
     )
     sample_prompt_btn.click(fn=on_click_sample_prompt, inputs=None, outputs=prompt_box)
