@@ -389,6 +389,7 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
 
         self.to(self._device)
         self._has_been_quantized = False
+        self.transformer_bf16 = None
 
         # Capture pipeline instance for closures
         pipeline_self = self
@@ -568,6 +569,67 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
             num_dummy_samples,
         )
 
+    def quantize(self, quant_mode, quant_config_path=None):
+        """
+        Quantize the pipeline using neural compressor.
+
+        Args:
+            quant_mode (`str`):
+                The quantization mode. Can be 'measure', 'quantize', or 'quantize-mixed'.
+            quant_config_path (`str`, *optional*):
+                Path to the quantization configuration JSON file. If not provided, it will try to get from QUANT_CONFIG env variable.
+        
+        Returns:
+            self: The pipeline itself for chaining.
+        """
+        # measure 모드는 __call__에서 처리
+        if quant_mode == "measure":
+            return self
+            
+        import habana_frameworks.torch.core as htcore
+
+        if quant_mode == "quantize-mixed":
+            import copy
+            self.transformer_bf16 = copy.deepcopy(self.transformer).to(self._execution_device)
+
+        if quant_mode in ("quantize", "quantize-mixed"):
+            import os
+
+            config_path = quant_config_path
+            if not config_path:
+                config_path = os.getenv("QUANT_CONFIG")
+            
+            if not config_path:
+                raise ImportError(
+                    "QUANT_CONFIG path is not defined. Please provide quant_config_path or define QUANT_CONFIG environment variable."
+                )
+            elif not os.path.isfile(config_path):
+                raise ImportError(f"Quantization config path '{config_path}' is not valid")
+
+            htcore.hpu_set_env()
+
+            from neural_compressor.torch.quantization import FP8Config, convert, prepare
+            from .pipeline_flux import FirstBlockWrapper
+            
+            config = FP8Config.from_json_file(config_path)
+
+            # Determine the base nn.Module for quantization and for FirstBlockWrapper updates
+            base_transformer_module_for_quant = self.transformer.module if hasattr(self.transformer, 'module') and isinstance(self.transformer.module, torch.nn.Module) else self.transformer
+            
+            if quant_mode == "quantize":
+                self.transformer = convert(base_transformer_module_for_quant, config)
+                current_underlying_module = self.transformer.module if hasattr(self.transformer, 'module') and isinstance(self.transformer.module, torch.nn.Module) else self.transformer
+
+                if hasattr(self, "first_block_wrapper_for_cache"):
+                    self.first_block_wrapper_for_cache = FirstBlockWrapper(current_underlying_module)
+                    self.first_block_hpu_graph_for_cache = wrap_in_hpu_graph(self.first_block_wrapper_for_cache)
+            
+            # Initialize the main transformer
+            htcore.hpu_initialize(self.transformer, mark_only_scales_as_const=True)
+        
+        self._has_been_quantized = True        
+        return self
+
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
@@ -673,13 +735,9 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
         import habana_frameworks.torch.core as htcore
 
         quant_mode = kwargs.get("quant_mode", None)
-
-        if quant_mode == "quantize-mixed":
-            import copy
-
-            transformer_bf16 = copy.deepcopy(self.transformer).to(self._execution_device)
-
-        if quant_mode in ("measure", "quantize", "quantize-mixed"):
+        
+        # measure 모드는 기존 방식대로 __call__에서 처리
+        if quant_mode == "measure":
             import os
 
             quant_config_path = os.getenv("QUANT_CONFIG")
@@ -693,42 +751,33 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
             htcore.hpu_set_env()
 
             from neural_compressor.torch.quantization import FP8Config, convert, prepare
-            # Ensure FirstBlockWrapper is available in this scope if used for type hinting or direct instantiation
-            from .pipeline_flux import FirstBlockWrapper 
-            # import pdb; pdb.set_trace()
+            from .pipeline_flux import FirstBlockWrapper
+            
             config = FP8Config.from_json_file(quant_config_path)
 
             # Determine the base nn.Module for quantization and for FirstBlockWrapper updates
-            # self.transformer could be an HPUGraphWrapper or the raw module
             base_transformer_module_for_quant = self.transformer.module if hasattr(self.transformer, 'module') and isinstance(self.transformer.module, torch.nn.Module) else self.transformer
             
-            if config.measure:
-                # 'prepare' can modify in-place or return a new object.
-                # If self.transformer was an HPUGraphWrapper, prepare might operate on its .module
-                # and potentially return a new wrapper or the modified module.
-                # We assign the result back to self.transformer.
-                self.transformer = prepare(base_transformer_module_for_quant, config) # Pass the underlying module
-                # After prepare, self.transformer might be the prepared module itself, or a wrapper.
-                # Get the actual prepared module for FirstBlockWrapper
-                current_underlying_module = self.transformer.module if hasattr(self.transformer, 'module') and isinstance(self.transformer.module, torch.nn.Module) else self.transformer
-
-                if hasattr(self, "first_block_wrapper_for_cache"): # Check if cache mechanism is active
-                    self.first_block_wrapper_for_cache = FirstBlockWrapper(current_underlying_module)
-                    # Re-wrap the (potentially observer-injected) FirstBlockWrapper
-                    self.first_block_hpu_graph_for_cache = wrap_in_hpu_graph(self.first_block_wrapper_for_cache)
-            elif config.quantize:
-                self.transformer = convert(base_transformer_module_for_quant, config) # Pass the underlying module
-                current_underlying_module = self.transformer.module if hasattr(self.transformer, 'module') and isinstance(self.transformer.module, torch.nn.Module) else self.transformer
-
-                if hasattr(self, "first_block_wrapper_for_cache"):
-                    self.first_block_wrapper_for_cache = FirstBlockWrapper(current_underlying_module)
-                    self.first_block_hpu_graph_for_cache = wrap_in_hpu_graph(self.first_block_wrapper_for_cache)
+            # prepare can modify in-place or return a new object
+            self.transformer = prepare(base_transformer_module_for_quant, config)
             
-            # Initialize the main transformer (which might be a module or HPU graph wrapper after prepare/convert)
+            # Get the actual prepared module for FirstBlockWrapper
+            current_underlying_module = self.transformer.module if hasattr(self.transformer, 'module') and isinstance(self.transformer.module, torch.nn.Module) else self.transformer
+
+            if hasattr(self, "first_block_wrapper_for_cache"):
+                self.first_block_wrapper_for_cache = FirstBlockWrapper(current_underlying_module)
+                self.first_block_hpu_graph_for_cache = wrap_in_hpu_graph(self.first_block_wrapper_for_cache)
+            
+            # Initialize the main transformer
             htcore.hpu_initialize(self.transformer, mark_only_scales_as_const=True)
-            # No separate htcore.hpu_initialize for first_block_wrapper/graph typically,
-            # as it uses parts of self.transformer which are now initialized.
-            # The wrap_in_hpu_graph for self.first_block_hpu_graph_for_cache handles its HPU setup.
+        # 다른 모드는 quantize 메서드 사용
+        elif quant_mode and not self._has_been_quantized:
+            self.quantize(quant_mode=quant_mode)
+
+        # Mixed quantization requires transformer_bf16
+        if quant_mode == "quantize-mixed" and not hasattr(self, "transformer_bf16"):
+            import copy
+            self.transformer_bf16 = copy.deepcopy(self.transformer).to(self._execution_device)
 
         height = height or self.default_sample_size * self.vae_scale_factor
         width = width or self.default_sample_size * self.vae_scale_factor
@@ -898,7 +947,7 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
 
                 if i >= quant_mixed_step:
                     # Mixed quantization
-                    noise_pred = transformer_bf16(
+                    noise_pred = self.transformer_bf16(
                         hidden_states=latents_batch,
                         timestep=timestep / 1000,
                         guidance=guidance_batch,
@@ -950,6 +999,7 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
             from neural_compressor.torch.quantization import finalize_calibration
 
             finalize_calibration(self.transformer)
+            self._has_been_quantized = True
 
         ht.hpu.synchronize()
         speed_metrics_prefix = "generation"

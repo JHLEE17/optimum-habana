@@ -11,24 +11,35 @@ import atexit
 
 MODEL_PATH = "/workspace/models/FLUX.1-dev"
 IMG_SAVE_PATH = "/workspace/jh/flux/outputs/gradio"
-RDT = 0.2
+RDT = 0.15
 HEIGHT = 1024
 WIDTH = 1024
 NUM_IMAGES_PER_PROMPT = 1 # Define as a constant for clarity
 BATCH_SIZE = 1 # Define as a constant for clarity
-FP8 = False
+FP8 = True
 USE_HPU_GRAPHS = True
 ENABLE_DUAL_PROCESS = True  # True면 Dual Inference, False면 기존처럼 오른쪽은 지연된 이미지
 SAME_SEED = True  
 RESIZE_IMAGES = False 
+
+# NOTE: Set this to the actual path of your FP8 quantization configuration JSON file.
+QUANT_CONFIG_FILE_PATH = "quantization/flux/quantize_config.json" 
 
 SAMPLE_PROMPTS = [
     "Hyper-real 3-D render of a transparent, high-gloss glass toy brick with four rounded studs on top. Smooth beveled edges shimmer in a cobalt-to-magenta gradient. Sharp specular highlights and a subtle inner glow give depth. The brick floats against pure black, emphasizing sheen and color.",
     "Hyper-real ray-traced 3-D render: slender, transparent glass rocket icon rotated 45° right. Smooth conical nose, tapered delta fins, rounded edges. Emerald-teal-amber edge gradient, sharp specular highlights, cyan core glow. Round window on fuselage, vivid red exhaust flame. Pure black background.",
     # "Storybook-style digital illustration of a rainy spring evening in Seoul. Neon Hangul signs shimmer on wet asphalt; cherry petals drift through fog as commuters with umbrellas pass glowing shops. Painterly gouache-watercolor texture, pastel-neon palette, soft diffusion, light film grain, nostalgic yet modern.",
     "Ultra-sharp 50 mm f/1.4 portrait of a Korean woman, late-20s, beside sheer-curtained window. Soft side light forms a Rembrandt triangle, revealing warm skin and crisp hair strands. Neutral linen blouse, calm genuine gaze. Wide-open aperture for creamy bokeh, true color, editorial realism",
-    "Ultra-high-resolution product photo of a luxury mechanical wristwatch lying on a brushed-steel surface, sapphire crystal facing the camera at 45 °, showing the open tourbillon cage, engraved minute markers, and a faint fingerprint on the glass. Studio lighting with multiple specular highlights and soft-box rim light.",
-    "Minimalist studio still-life of a clear glass teapot filled with amber oolong tea on a pure-white marble slab. Soft diagonal daylight, subtle caustics on the surface, gentle shadow fall-off, no other objects in frame."
+    "Ultra-sharp 50 mm f/1.4 portrait of a Korean woman, late-20s, beside sheer-curtained window. Soft side light forms a Rembrandt triangle, revealing warm skin and crisp hair strands. Neutral linen blouse, calm genuine gaze. Wide-open aperture for creamy bokeh, true color, editorial realism",
+    # "Ultra-high-resolution product photo of a luxury mechanical wristwatch lying on a brushed-steel surface, sapphire crystal facing the camera at 45 °, showing the open tourbillon cage, engraved minute markers, and a faint fingerprint on the glass. Studio lighting with multiple specular highlights and soft-box rim light.",
+    "Minimalist studio still-life of a clear glass teapot filled with amber oolong tea on a pure-white marble slab. Soft diagonal daylight, subtle caustics on the surface, gentle shadow fall-off, no other objects in frame.",
+    "Classic American traditional tattoo style Winston Churchill looking at iPhone.. Bold lines, nautical elements, retro flair, symbolic",
+    "A serene portrait of Yuzuru Otonashi from *Angel Beats!* in Studio Ghibli's soft, painterly style. He stands in a sunlit field of wildflowers, wearing his crisp white school uniform with a gentle breeze rustling his dark, slightly messy hair. His warm brown eyes reflect quiet determination and kindness, with soft Ghibli-style shading enhancing his youthful features. Delicate cherry blossom petals drift in the air around him, glowing under golden-hour sunlight. The background blends lush greenery and distant rolling hills, evoking Ghibli’s dreamy landscapes. Subtle ethereal glow and muted pastel tones create a nostalgic, melancholic yet hopeful atmosphere, capturing the emotional depth of the series while maintaining Ghibli’s whimsical charm.",
+    "A breathtaking panorama of the Lake District at dawn, where gentle hills roll into the distance, their slopes adorned with vibrant patches of heather and lush green grass. A serene lake mirrors the soft pastels of the early morning sky, reflecting hues of lavender and peach as sunlight begins to break through the mist. Wisps of fog linger over the water, creating an ethereal atmosphere. Majestic, rugged peaks rise in the background, their rocky faces dusted with the remnants of overnight rain, glistening under the soft golden light. The scene is tranquil yet invigorating, evoking a sense of peace and wonder. Capture this landscape in a painterly style, emphasizing the interplay of light and shadow, with a focus on texture and depth, reminiscent of the works of J.M.W. Turner.",
+    "A charismatic speaker is captured mid-speech, his [short, tousled brown] hairs lightly messy on top. He has a round face, clean-shaven, and wears [rounded rectangular glasses with dark rims]. He is holding a black microphone in his right hand, speaking passionately. His expression is animated as he gestures with his left hand. Dressed in [a light blue sweater over a white t-shirt]. The background is blurred, showcasing a white banner with logos, suggesting a professional [conference] setting.",
+    "a silhouette of a lone surfer riding a massive wave under a sunset sky, water",
+    "a futuristic motorcycle speeding along a neon-lit highway at night, streaks of light trailing behind",
+    "A rugged old man in a heavy wool coat stands against a raging sea, his weathered hands gripping the rail of a storm-battered lighthouse. Waves crash violently against the rocky shore, and the sky is painted in deep purples and oranges as the sun sets behind rolling clouds. His eyes tell a story of solitude, resilience, and untold tales",
 ]
 
 # 전역 executor (프로세스 2개)
@@ -41,16 +52,18 @@ _pipeline_cache = {}
 def initialize_pipeline(rdt=RDT, use_hpu_graphs=USE_HPU_GRAPHS):
     """Initialize the pipeline with the given parameters"""
     global _pipeline_cache
-    key = (rdt, use_hpu_graphs)
+    key = (rdt, use_hpu_graphs, FP8)  # Add FP8 to the cache key
     
     # 캐시된 파이프라인이 있으면 재사용
     if key in _pipeline_cache:
         return _pipeline_cache[key]
     
-    print(f"Loading new pipeline with rdt={rdt}, use_hpu_graphs={use_hpu_graphs}")
+    print(f"Loading new pipeline with rdt={rdt}, use_hpu_graphs={use_hpu_graphs}, FP8={FP8}")
     scheduler_obj = GaudiFlowMatchEulerDiscreteScheduler.from_pretrained(
         MODEL_PATH, subfolder="scheduler", timestep_spacing="linspace"
     )
+    
+    # 1. Pipeline 초기화
     kwargs_pipe = {
         "use_habana": True,
         "use_hpu_graphs": use_hpu_graphs,
@@ -61,6 +74,13 @@ def initialize_pipeline(rdt=RDT, use_hpu_graphs=USE_HPU_GRAPHS):
         "rdt": rdt
     }
     pipe = GaudiFluxPipeline.from_pretrained(MODEL_PATH, **kwargs_pipe)
+    
+    # 2. Quantization 수행 (FP8 옵션이 활성화된 경우)
+    if FP8:
+        print(f"Applying FP8 quantization")
+        pipe.quantize(quant_mode="quantize", quant_config_path=QUANT_CONFIG_FILE_PATH)
+    
+    # 3. RDT 설정 (기존 코드와 동일)
     if rdt > 0:
         from para_attn.first_block_cache.diffusers_adapters import apply_cache_on_pipe
         apply_cache_on_pipe(pipe, residual_diff_threshold=rdt)
@@ -69,7 +89,7 @@ def initialize_pipeline(rdt=RDT, use_hpu_graphs=USE_HPU_GRAPHS):
     _pipeline_cache[key] = pipe
     return pipe
 
-def inference_worker(prompt, rdt, use_hpu_graphs, seed=None):
+def inference_worker(prompt, rdt, use_hpu_graphs, seed=None, force_no_fp8: bool = False):
     # 각 프로세스에서 최초 1회만 모델을 로드하고 재사용
     global _pipeline_cache
     import torch, random, time, gc
@@ -83,12 +103,19 @@ def inference_worker(prompt, rdt, use_hpu_graphs, seed=None):
     if '_pipeline_cache' not in globals():
         _pipeline_cache = {}
     
-    key = (rdt, use_hpu_graphs)
+    # Determine actual quantization state for this worker based on global FP8 and force_no_fp8 flag
+    apply_quantization_for_worker = FP8 and not force_no_fp8
+    
+    key = (rdt, use_hpu_graphs, apply_quantization_for_worker) # Use actual quantization state for cache key
     if key not in _pipeline_cache:
-        print(f"[Worker] Loading new pipeline with rdt={rdt}, use_hpu_graphs={use_hpu_graphs}")
+        print(f"[Worker] Loading new pipeline with rdt={rdt}, use_hpu_graphs={use_hpu_graphs}, FP8 (applied)={apply_quantization_for_worker}")
+        
+        # 1. 스케줄러 초기화
         scheduler_obj = GaudiFlowMatchEulerDiscreteScheduler.from_pretrained(
             MODEL_PATH, subfolder="scheduler", timestep_spacing="linspace"
         )
+        
+        # 2. 파이프라인 초기화
         kwargs_pipe = {
             "use_habana": True,
             "use_hpu_graphs": use_hpu_graphs,
@@ -99,9 +126,17 @@ def inference_worker(prompt, rdt, use_hpu_graphs, seed=None):
             "rdt": rdt
         }
         pipe = GaudiFluxPipeline.from_pretrained(MODEL_PATH, **kwargs_pipe)
+        
+        # 3. Quantization 적용 (필요한 경우)
+        if apply_quantization_for_worker:
+            print(f"[Worker] Applying FP8 quantization")
+            pipe.quantize(quant_mode="quantize", quant_config_path=QUANT_CONFIG_FILE_PATH)
+        
+        # 4. RDT 설정 (기존 코드와 동일)
         if rdt > 0:
             from para_attn.first_block_cache.diffusers_adapters import apply_cache_on_pipe
             apply_cache_on_pipe(pipe, residual_diff_threshold=rdt)
+            
         _pipeline_cache[key] = pipe
     
     pipe = _pipeline_cache[key]
@@ -123,8 +158,9 @@ def inference_worker(prompt, rdt, use_hpu_graphs, seed=None):
         "height": HEIGHT,
         "width": WIDTH,
         "throughput_warmup_steps": 0,
-        "quant_mode": "quantize" if FP8 else None,
     }
+    
+    # FP8 quantization이 이미 별도로 적용되었으므로 quant_mode 파라미터 제거
     
     t0 = time.time()
     outputs = pipe(**kwargs_call)
@@ -356,8 +392,10 @@ def on_submit_generate(prompt, user_seed=None, use_random_seed=True):
     
     if ENABLE_DUAL_PROCESS:
         # ProcessPoolExecutor를 사용한 병렬 추론
-        left_future = _executor.submit(inference_worker, prompt, RDT, USE_HPU_GRAPHS, shared_seed)
-        right_future = _executor.submit(inference_worker, prompt, 0.0, USE_HPU_GRAPHS, shared_seed)
+        # Left pipeline respects global FP8 setting
+        left_future = _executor.submit(inference_worker, prompt, RDT, USE_HPU_GRAPHS, shared_seed, force_no_fp8=False)
+        # Right pipeline explicitly disables FP8 quantization
+        right_future = _executor.submit(inference_worker, prompt, 0.0, USE_HPU_GRAPHS, shared_seed, force_no_fp8=True)
         done_left = False
         done_right = False
         current_left_time_html = loading_msg
@@ -490,7 +528,6 @@ def on_submit_generate(prompt, user_seed=None, use_random_seed=True):
                 "height": HEIGHT,
                 "width": WIDTH,
                 "throughput_warmup_steps": 0,
-                "quant_mode": "quantize" if FP8 else None,
             }
             
             # 프로그레스 바 업데이트 시작
@@ -707,7 +744,7 @@ with gr.Blocks(title="Flux Image Generation UI", css=custom_css) as demo:
 
     with gr.Row():
         with gr.Column(scale=2.5, elem_id="random-seed-checkbox"):
-            seed_checkbox = gr.Checkbox(label="Use Random Seed", value=True)
+            seed_checkbox = gr.Checkbox(label="Use Random Seed", value=False)
         with gr.Column(scale=3.5):
             # Replace standard Number component with a Row containing Text and Number
             with gr.Row(elem_id="seed-row"):
