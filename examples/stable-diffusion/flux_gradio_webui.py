@@ -3,27 +3,99 @@ import time
 import torch
 import gc
 import random
+import argparse
+import asyncio
+import os
+import base64
+import requests
+import replicate
+import json
+import traceback
+import sys
 from PIL import Image # For image concatenation
 from optimum.habana.diffusers import GaudiFlowMatchEulerDiscreteScheduler, GaudiFluxPipeline
 from optimum.habana.utils import set_seed # For setting the seed
 from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 import atexit
+# from dotenv import load_dotenv
+import io
 
+# Load environment variables from .env file
+# load_dotenv()
+
+FP8 = True
+RDT = 0.15
 MODEL_PATH = "/workspace/models/FLUX.1-dev"
 IMG_SAVE_PATH = "/workspace/jh/flux/outputs/gradio"
-RDT = 0.15
 HEIGHT = 1024
 WIDTH = 1024
 NUM_IMAGES_PER_PROMPT = 1 # Define as a constant for clarity
 BATCH_SIZE = 1 # Define as a constant for clarity
-FP8 = True
 USE_HPU_GRAPHS = True
 ENABLE_DUAL_PROCESS = True  # True면 Dual Inference, False면 기존처럼 오른쪽은 지연된 이미지
 SAME_SEED = True  
 RESIZE_IMAGES = False 
+GUIDANCE_SCALE = 3.5
 
 # NOTE: Set this to the actual path of your FP8 quantization configuration JSON file.
 QUANT_CONFIG_FILE_PATH = "quantization/flux/quantize_config.json" 
+
+
+# Parse command line arguments
+parser = argparse.ArgumentParser(description="Flux Image Generation WebUI")
+parser.add_argument("--compare", action="store_true", help="Enable comparison mode with multiple APIs")
+parser.add_argument("--fal-key", type=str, help="Fal.ai API key")
+parser.add_argument("--replicate-key", type=str, help="Replicate API key")
+parser.add_argument("--wavespeed-key", type=str, help="WaveSpeed API key")
+parser.add_argument("--runware-key", type=str, help="Runware API key")
+parser.add_argument("--debug", action="store_true", help="Enable debug mode with detailed logging")
+parser.add_argument("--skip-local", action="store_true", help="Skip local model inference (useful for testing the UI)")
+parser.add_argument("--log-file", type=str, default="api_debug.log", help="File to save API debug logs")
+parser.add_argument("--save-responses", action="store_true", help="Save API responses to files")
+args = parser.parse_args()
+
+# Set debug mode
+DEBUG_MODE = args.debug
+if DEBUG_MODE:
+    print("Debug mode enabled - detailed logging will be shown")
+
+# Skip local models flag
+SKIP_LOCAL_MODELS = args.skip_local
+if SKIP_LOCAL_MODELS:
+    print("Local model inference will be skipped (for UI testing only)")
+
+# API keys for external services (when in compare mode)
+# .env 로부터 API 키 로드 (있는 경우) 또는 명령줄 인자에서 로드
+FAL_KEY = args.fal_key or os.getenv("FAL_KEY")
+REPLICATE_API_TOKEN = args.replicate_key or os.getenv("REPLICATE_API_TOKEN")
+WAVESPEED_API_KEY = args.wavespeed_key or os.getenv("WAVESPEED_API_KEY") 
+RUNWARE_API_KEY = args.runware_key or os.getenv("RUNWARE_API_KEY")
+
+# For debugging
+print(f"API Keys available: FAL_KEY={bool(FAL_KEY)}, REPLICATE={bool(REPLICATE_API_TOKEN)}, WAVESPEED={bool(WAVESPEED_API_KEY)}, RUNWARE={bool(RUNWARE_API_KEY)}")
+
+# API service model definitions
+FAL_MODEL = "fal-ai/flux/dev"
+REPLICATE_MODEL = "black-forest-labs/flux-dev"
+WAVESPEED_MODELS = {
+    "wavespeed_dev": "wavespeed-ai/flux-dev",
+    "wavespeed_fast": "wavespeed-ai/flux-dev-ultra-fast",
+}
+RUNWARE_MODEL = "runware:101@1"
+
+# Initialize API clients
+if args.compare:
+    # Only initialize these if --compare flag is used
+    try:
+        if REPLICATE_API_TOKEN:
+            replicate_client = replicate.Client(api_token=REPLICATE_API_TOKEN)
+            print("Replicate client initialized")
+        else:
+            print("Warning: REPLICATE_API_TOKEN not found, skipping initialization")
+        # Other clients will be initialized as needed
+    except Exception as e:
+        print(f"Warning: Failed to initialize some API clients: {e}")
+        print("Comparison mode may not work properly without all API keys")
 
 SAMPLE_PROMPTS = [
     "Hyper-real 3-D render of a transparent, high-gloss glass toy brick with four rounded studs on top. Smooth beveled edges shimmer in a cobalt-to-magenta gradient. Sharp specular highlights and a subtle inner glow give depth. The brick floats against pure black, emphasizing sheen and color.",
@@ -34,7 +106,7 @@ SAMPLE_PROMPTS = [
     # "Ultra-high-resolution product photo of a luxury mechanical wristwatch lying on a brushed-steel surface, sapphire crystal facing the camera at 45 °, showing the open tourbillon cage, engraved minute markers, and a faint fingerprint on the glass. Studio lighting with multiple specular highlights and soft-box rim light.",
     "Minimalist studio still-life of a clear glass teapot filled with amber oolong tea on a pure-white marble slab. Soft diagonal daylight, subtle caustics on the surface, gentle shadow fall-off, no other objects in frame.",
     "Classic American traditional tattoo style Winston Churchill looking at iPhone.. Bold lines, nautical elements, retro flair, symbolic",
-    "A serene portrait of Yuzuru Otonashi from *Angel Beats!* in Studio Ghibli's soft, painterly style. He stands in a sunlit field of wildflowers, wearing his crisp white school uniform with a gentle breeze rustling his dark, slightly messy hair. His warm brown eyes reflect quiet determination and kindness, with soft Ghibli-style shading enhancing his youthful features. Delicate cherry blossom petals drift in the air around him, glowing under golden-hour sunlight. The background blends lush greenery and distant rolling hills, evoking Ghibli’s dreamy landscapes. Subtle ethereal glow and muted pastel tones create a nostalgic, melancholic yet hopeful atmosphere, capturing the emotional depth of the series while maintaining Ghibli’s whimsical charm.",
+    "A serene portrait of Yuzuru Otonashi from *Angel Beats!* in Studio Ghibli's soft, painterly style. He stands in a sunlit field of wildflowers, wearing his crisp white school uniform with a gentle breeze rustling his dark, slightly messy hair. His warm brown eyes reflect quiet determination and kindness, with soft Ghibli-style shading enhancing his youthful features. Delicate cherry blossom petals drift in the air around him, glowing under golden-hour sunlight. The background blends lush greenery and distant rolling hills, evoking Ghibli's dreamy landscapes. Subtle ethereal glow and muted pastel tones create a nostalgic, melancholic yet hopeful atmosphere, capturing the emotional depth of the series while maintaining Ghibli's whimsical charm.",
     "A breathtaking panorama of the Lake District at dawn, where gentle hills roll into the distance, their slopes adorned with vibrant patches of heather and lush green grass. A serene lake mirrors the soft pastels of the early morning sky, reflecting hues of lavender and peach as sunlight begins to break through the mist. Wisps of fog linger over the water, creating an ethereal atmosphere. Majestic, rugged peaks rise in the background, their rocky faces dusted with the remnants of overnight rain, glistening under the soft golden light. The scene is tranquil yet invigorating, evoking a sense of peace and wonder. Capture this landscape in a painterly style, emphasizing the interplay of light and shadow, with a focus on texture and depth, reminiscent of the works of J.M.W. Turner.",
     "A charismatic speaker is captured mid-speech, his [short, tousled brown] hairs lightly messy on top. He has a round face, clean-shaven, and wears [rounded rectangular glasses with dark rims]. He is holding a black microphone in his right hand, speaking passionately. His expression is animated as he gestures with his left hand. Dressed in [a light blue sweater over a white t-shirt]. The background is blurred, showcasing a white banner with logos, suggesting a professional [conference] setting.",
     "a silhouette of a lone surfer riding a massive wave under a sunset sky, water",
@@ -48,6 +120,308 @@ atexit.register(_executor.shutdown)
 
 # 파이프라인 캐시 (전역 변수)
 _pipeline_cache = {}
+
+# Create debug log file
+log_file_path = args.log_file
+with open(log_file_path, "w") as f:
+    f.write(f"===== API Debug Log Started at {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+    
+def log_debug(message):
+    """Log a debug message to console and file"""
+    timestamp = time.strftime("%H:%M:%S")
+    full_message = f"[{timestamp}] {message}"
+    print(full_message)
+    try:
+        with open(log_file_path, "a") as f:
+            f.write(f"{full_message}\n")
+            f.flush()  # Force writing to disk
+    except Exception as e:
+        print(f"Error writing to log file: {e}")
+
+def save_response(name, data):
+    """Save API response data to a file"""
+    if not args.save_responses:
+        return
+    
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    filename = f"{name}_{timestamp}.json"
+    try:
+        with open(filename, "w") as f:
+            if isinstance(data, (dict, list)):
+                json.dump(data, f, indent=2)
+            else:
+                f.write(str(data))
+        log_debug(f"Saved {name} response to {filename}")
+    except Exception as e:
+        log_debug(f"Error saving response: {e}")
+
+# API service functions for comparison mode
+async def call_runware_api_async(prompt, height=HEIGHT, width=WIDTH, seed=None):
+    """Call the Runware API for image generation (async version)"""
+    try:
+        import sys
+        sys.path.append(".")  # Make sure runware module can be imported
+        from runware import Runware, IImageInference
+        
+        t0 = time.time()
+        
+        # Initialize Runware client
+        runware = Runware(api_key=RUNWARE_API_KEY)
+        await runware.connect()
+        
+        # Prepare request
+        request_image = IImageInference(
+            positivePrompt=prompt,
+            model=RUNWARE_MODEL,
+            numberResults=1,
+            height=height,
+            width=width,
+            steps=28,
+            CFGScale=GUIDANCE_SCALE,
+            outputType="URL",
+            outputFormat="png",
+            seed=seed,
+        )
+        
+        # Get images
+        images = await runware.imageInference(requestImage=request_image)
+        
+        t1 = time.time()
+        elapsed = t1 - t0
+        
+        if not images:
+            return None, elapsed
+            
+        # Download the image from URL
+        image_url = images[0].imageURL
+        response = requests.get(image_url, timeout=60)
+        response.raise_for_status()
+        
+        img = Image.open(io.BytesIO(response.content))
+        
+        # Save image if needed
+        if IMG_SAVE_PATH:
+            timestamp = int(time.time())
+            save_path = os.path.join(IMG_SAVE_PATH, f"runware_{timestamp}.png")
+            img.save(save_path)
+        
+        return img, elapsed
+    except Exception as e:
+        print(f"Error calling Runware API: {e}")
+        return None, 0
+
+def call_runware_api(prompt, height=HEIGHT, width=WIDTH, seed=None):
+    """Non-async wrapper for Runware API"""
+    try:
+        # Run the async function in a new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        result = loop.run_until_complete(call_runware_api_async(prompt, height, width, seed))
+        loop.close()
+        return result
+    except Exception as e:
+        print(f"Error in Runware API wrapper: {e}")
+        return None, 0
+
+def call_fal_api(prompt, height=HEIGHT, width=WIDTH, timeout=30, seed=None):
+    """Call the fal.ai API for image generation"""
+    try:
+        # Try to import fal_client only when needed
+        try:
+            import fal_client
+            log_debug("fal_client module imported successfully")
+        except ImportError:
+            log_debug("fal_client module not found. Please install with 'pip install fal-client'")
+            return None, 0, None
+        
+        t0 = time.time()
+        
+        # Ensure the API key is set
+        if FAL_KEY:
+            os.environ["FAL_KEY"] = FAL_KEY
+            log_debug(f"Set FAL_KEY in environment (length: {len(FAL_KEY)})")
+        else:
+            log_debug("No FAL_KEY available in environment")
+            return None, 0, "No API key available"
+        
+        log_debug(f"Calling fal.ai API with prompt: '{prompt[:30]}...' and timeout: {timeout}s")
+        
+        # Call fal.ai API with timeout
+        result = fal_client.run(
+            FAL_MODEL,
+            arguments={
+                "prompt": prompt,
+                "image_size": {
+                    "width": width,
+                    "height": height,
+                }, #"square_hd" if height == width else "portrait_hd" if height > width else "landscape_hd",
+                "seed": seed,
+                "num_images": 1,
+                "num_inference_steps": 28,
+                "guidance_scale": GUIDANCE_SCALE,
+            },
+            timeout=timeout,
+        )
+        
+        log_debug(f"fal.ai API response received with keys: {list(result.keys())}")
+        
+        # Download image from URL
+        image_url = result["images"][0]["url"]
+        log_debug(f"Image URL: {image_url[:50]}...")
+        
+        response = requests.get(image_url, timeout=20)
+        response.raise_for_status()
+        log_debug("Image downloaded successfully")
+        
+        img = Image.open(io.BytesIO(response.content))
+        log_debug(f"Image opened successfully: {img.size}")
+        
+        t1 = time.time()
+        elapsed = t1 - t0
+        log_debug(f"Total fal.ai process completed in {elapsed:.2f}s")
+        
+        # Save image if needed
+        if IMG_SAVE_PATH:
+            timestamp = int(time.time())
+            save_path = os.path.join(IMG_SAVE_PATH, f"fal_{timestamp}.png")
+            img.save(save_path)
+            log_debug(f"Image saved to {save_path}")
+        
+        # Save response for debugging
+        save_response("fal", result)
+        
+        return img, elapsed, None
+    except Exception as e:
+        error_message = f"Error in call_fal_api: {str(e)}"
+        log_debug(error_message)
+        log_debug(f"Traceback: {traceback.format_exc()}")
+        return None, 0, error_message
+
+def call_replicate_api(prompt, height=HEIGHT, width=WIDTH, timeout=60, seed=None):
+    """Call the Replicate API for image generation"""
+    try:
+        t0 = time.time()
+        
+        # Call Replicate API with timeout
+        result = replicate_client.run(
+            REPLICATE_MODEL,
+            input={
+                "prompt": prompt,
+                "height": height,
+                "width": width,
+                "guidance": GUIDANCE_SCALE,
+                "seed": seed,
+                "num_inference_steps": 28,
+                "num_outputs": 1,
+            },
+            timeout=timeout,
+        )
+        
+        image_url = result[0] if isinstance(result, list) else result
+        response = requests.get(image_url, timeout=20)
+        response.raise_for_status()
+        
+        img = Image.open(io.BytesIO(response.content))
+        
+        t1 = time.time()
+        elapsed = t1 - t0
+        
+        # Save image if needed
+        if IMG_SAVE_PATH:
+            timestamp = int(time.time())
+            save_path = os.path.join(IMG_SAVE_PATH, f"replicate_{timestamp}.png")
+            img.save(save_path)
+        
+        return img, elapsed, image_url
+    except Exception as e:
+        print(f"Error calling Replicate API: {e}")
+        return None, 0, None
+
+def call_wavespeed_api(prompt, model_type="fast", height=HEIGHT, width=WIDTH, timeout=60, seed=None):
+    """Call the WaveSpeed API for image generation"""
+    try:
+        t0 = time.time()
+        
+        # Determine which WaveSpeed model to use
+        if model_type == "fast":
+            model_slug = WAVESPEED_MODELS["wavespeed_fast"]
+        else:
+            model_slug = WAVESPEED_MODELS["wavespeed_dev"]
+        
+        # Prepare API request
+        submit_url = f"https://api.wavespeed.ai/api/v2/{model_slug}"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {WAVESPEED_API_KEY}",
+        }
+        payload = {
+            "prompt": prompt,
+            "size": f"{width}*{height}",
+            "num_images": 1,
+            "enable_base64_output": True,
+            "enable_safety_checker": True,
+            "guidance_scale": GUIDANCE_SCALE,
+            "num_inference_steps": 28,
+            "seed": seed,
+            "strength": 0.8,
+        }
+        
+        # Submit job
+        resp = requests.post(submit_url, headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        task_id = resp.json()["data"]["id"]
+        
+        # Poll for results with timeout
+        result_url = f"https://api.wavespeed.ai/api/v2/predictions/{task_id}/result"
+        max_poll_time = t0 + timeout
+        
+        while time.time() < max_poll_time:
+            res = requests.get(result_url, headers=headers, timeout=30)
+            res.raise_for_status()
+            data = res.json()["data"]
+            status = data["status"]
+            
+            if status == "completed":
+                output = data["outputs"][0]
+                # Handle URL or base64
+                if output.startswith("http"):
+                    img_resp = requests.get(output, timeout=30)
+                    img_resp.raise_for_status()
+                    content = img_resp.content
+                    ext = "png"
+                elif output.startswith("data:image"):
+                    header, b64 = output.split(",", 1)
+                    ext = header.split("/")[1].split(";")[0]  # png / webp ...
+                    content = base64.b64decode(b64)
+                else:
+                    content = base64.b64decode(output)
+                    ext = "png"
+                
+                # Create image from bytes
+                img = Image.open(io.BytesIO(content))
+                
+                t1 = time.time()
+                elapsed = t1 - t0
+                
+                # Save image if needed
+                if IMG_SAVE_PATH:
+                    timestamp = int(time.time())
+                    save_path = os.path.join(IMG_SAVE_PATH, f"wavespeed_{model_type}_{timestamp}.{ext}")
+                    img.save(save_path)
+                
+                return img, elapsed
+            
+            if status == "failed":
+                raise RuntimeError(data.get("error", "WaveSpeed task failed"))
+            
+            time.sleep(1)  # wait then poll again
+            
+        # If we get here, we've timed out
+        raise TimeoutError(f"WaveSpeed API polling timed out after {timeout} seconds")
+        
+    except Exception as e:
+        print(f"Error calling WaveSpeed API ({model_type}): {e}")
+        return None, 0
 
 def initialize_pipeline(rdt=RDT, use_hpu_graphs=USE_HPU_GRAPHS):
     """Initialize the pipeline with the given parameters"""
@@ -158,6 +532,7 @@ def inference_worker(prompt, rdt, use_hpu_graphs, seed=None, force_no_fp8: bool 
         "height": HEIGHT,
         "width": WIDTH,
         "throughput_warmup_steps": 0,
+        "guidance_scale": GUIDANCE_SCALE,
     }
     
     # FP8 quantization이 이미 별도로 적용되었으므로 quant_mode 파라미터 제거
@@ -258,36 +633,54 @@ custom_css = """
 
 /* Title styling */
 .title-text {
-    margin-bottom: 10px !important;
+    margin-bottom: 0px !important;
     font-weight: bold !important;
-    font-size: 1.5em !important;
+    font-size: 1.3em !important;
+    text-align: center !important;
+    display: inline-block !important;
 }
 
 /* Time text styling */
 .time-text {
-    margin-top: 10px !important;
-    margin-bottom: 20px !important;
-    padding: 10px !important;
+    margin-top: 0px !important;
+    margin-bottom: 0px !important;
+    margin-left: 10px !important;
+    padding: 5px !important;
     background-color: rgba(0, 0, 0, 0.1) !important;
     border-radius: 5px !important;
+    font-size: 1.0em !important;
+    line-height: 1 !important;
+    height: auto !important;
+    min-height: 8px !important;
+    display: inline-block !important;
+    vertical-align: middle !important;
+    text-align: center !important;
 }
 
 /* Full viewport height containers */
 .contain-row {
-    min-height: 600px !important;
+    min-height: 420px !important;
 }
 
 /* Image styling - expand to fill container */
 .large-image {
     width: 100% !important;
-    height: 600px !important;
-    object-fit: contain !important;
+    height: 640px !important; /* Default height for non-compare mode. Increased from 300px */
+    margin: 0 auto !important; /* Centers the .large-image block if its container is wider. */
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    overflow: hidden !important; /* Good practice. */
 }
 
-/* Force images to be large */
+/* CSS for the actual <img> tag within the .large-image container */
 .large-image img {
-    width: 100% !important;
+    display: block !important;
+    max-width: 100% !important;
     max-height: 100% !important;
+    object-fit: contain !important;
+    border: 2px solid #444 !important; /* Merged from original */
+    border-radius: 8px !important; /* Merged from original */
 }
 
 /* Put a border around images to see them better */
@@ -335,6 +728,30 @@ custom_css = """
     width: auto !important;
     min-width: 0 !important;
 }
+
+/* Image sizing for comparison layout */
+.compact-column {
+    padding: 5px !important;
+    margin: 0 !important;
+}
+
+.compact-column .large-image {
+    height: 450px !important;
+    width: 450px !important;
+}
+
+.compact-column .time-text {
+    min-height: 20px !important;
+    font-size: 1.2em !important;
+}
+
+/* Title container to hold title and time together */
+.title-container {
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    margin-bottom: 5px !important;
+}
 """
 
 # 동물 아이콘 대신 프로그레스 바를 위한 HTML 템플릿
@@ -357,6 +774,31 @@ def create_progress_html(elapsed_seconds=0, is_left=True, progress_speed=5):
     """
 
 def on_submit_generate(prompt, user_seed=None, use_random_seed=True):
+    # Determine seed for this generation
+    if use_random_seed:
+        if SAME_SEED:
+            shared_seed = random.randint(0, 2**32 - 1)
+        else:
+            shared_seed = None
+    else:
+        try:
+            # Convert to integer and ensure it's within allowed range
+            shared_seed = int(user_seed)
+            if shared_seed < 0 or shared_seed > 2**32 - 1:
+                shared_seed = random.randint(0, 2**32 - 1)
+                print(f"Seed out of range, using random seed instead: {shared_seed}")
+        except (ValueError, TypeError):
+            shared_seed = random.randint(0, 2**32 - 1)
+            print(f"Invalid seed input, using random seed instead: {shared_seed}")
+    
+    print(f"on_submit_generate called with prompt: {prompt}, seed: {shared_seed}, random: {use_random_seed}, compare: {args.compare}")
+    
+    # Handle compare mode (2x4 grid)
+    if args.compare:
+        print("Running in compare mode")
+        return on_submit_generate_compare(prompt, shared_seed)
+    
+    # Original mode (1x2 grid)
     loading_msg = "<p style='text-align:center; font-weight:bold;'>⏳ 이미지 생성 중... 잠시만 기다려주세요.</p>"
     elapsed_offset = 0.3
     left_progress_speed = 34
@@ -373,22 +815,6 @@ def on_submit_generate(prompt, user_seed=None, use_random_seed=True):
         gr.update(visible=True, value=initial_progress_right),               
         gr.update(visible=False)                           
     )
-    
-    if use_random_seed:
-        if SAME_SEED:
-            shared_seed = random.randint(0, 2**32 - 1)
-        else:
-            shared_seed = None
-    else:
-        try:
-            # Convert to integer and ensure it's within allowed range
-            shared_seed = int(user_seed)
-            if shared_seed < 0 or shared_seed > 2**32 - 1:
-                shared_seed = random.randint(0, 2**32 - 1)
-                print(f"Seed out of range, using random seed instead: {shared_seed}")
-        except (ValueError, TypeError):
-            shared_seed = random.randint(0, 2**32 - 1)
-            print(f"Invalid seed input, using random seed instead: {shared_seed}")
     
     if ENABLE_DUAL_PROCESS:
         # ProcessPoolExecutor를 사용한 병렬 추론
@@ -528,6 +954,7 @@ def on_submit_generate(prompt, user_seed=None, use_random_seed=True):
                 "height": HEIGHT,
                 "width": WIDTH,
                 "throughput_warmup_steps": 0,
+                "guidance_scale": GUIDANCE_SCALE,
             }
             
             # 프로그레스 바 업데이트 시작
@@ -694,50 +1121,447 @@ def on_submit_generate(prompt, user_seed=None, use_random_seed=True):
                 gr.update(visible=False)
             )
 
+# New function to handle compare mode with 2x4 grid of images
+def on_submit_generate_compare(prompt, shared_seed):
+    """
+    Handle generation in compare mode with multiple API calls in a 2x4 grid
+    Row 1: [right_future, fal, replicate, runware]
+    Row 2: [left_future, wavespeed_fast, wavespeed_dev, empty]
+    """
+    log_debug(f"Starting comparison mode generation with prompt: '{prompt[:50]}...'")
+    log_debug(f"Using seed: {shared_seed}")
+    
+    # Define placeholders for all 8 positions with their corresponding indices
+    services = {
+        0: "vanilla",         # right_future
+        1: "fal",             # fal.ai
+        2: "replicate",       # replicate
+        3: "runware",         # runware
+        4: "sqzb",            # left_future (SQZB Optimized)
+        5: "wavespeed_fast",  # wavespeed fast
+        6: "wavespeed_dev",   # wavespeed dev
+        7: "empty"            # empty cell
+    }
+    
+    # Initialize all cells with default values
+    cell_states = []
+    for i in range(8):
+        cell_states.append([
+            "<p style='text-align:center;'>Ready</p>",  # time_html
+            gr.HTML(visible=False),                     # progress_html
+            None                                        # image
+        ])
+    
+    # Send initial state - Generate exactly 24 outputs (8 cells × 3 components)
+    log_debug("Initial UI update...")
+    try:
+        outputs = yield_ui_update(cell_states)
+        if outputs:
+            log_debug(f"Yielding {len(outputs)} outputs")
+            yield outputs
+            log_debug("Initial UI update successful")
+        else:
+            log_debug("Failed to generate initial UI outputs")
+            return
+    except Exception as e:
+        log_debug(f"Error in initial UI update: {str(e)}")
+        log_debug(f"Traceback: {traceback.format_exc()}")
+        return
+    
+    # 모든 셀 상태 업데이트 - 서비스별 상태 메시지 표시
+    for i in range(8):
+        if i == 0:  # Vanilla 모델
+            if SKIP_LOCAL_MODELS:
+                cell_states[i][0] = "<p style='color:gray; text-align:center;'>Skipped (--skip-local)</p>"
+            else:
+                cell_states[i][0] = "<p style='text-align:center; font-weight:bold;'>준비 중...</p>"
+        elif i == 1:  # Fal.ai
+            if not FAL_KEY:
+                cell_states[i][0] = "<p style='color:orange; text-align:center;'>No fal.ai API key</p>"
+            else:
+                cell_states[i][0] = "<p style='text-align:center; font-weight:bold;'>준비 중...</p>"
+        elif i == 2:  # Replicate
+            if not REPLICATE_API_TOKEN:
+                cell_states[i][0] = "<p style='color:orange; text-align:center;'>No Replicate API key</p>"
+            else:
+                cell_states[i][0] = "<p style='text-align:center; font-weight:bold;'>준비 중...</p>"
+        elif i == 3:  # Runware
+            if not RUNWARE_API_KEY:
+                cell_states[i][0] = "<p style='color:orange; text-align:center;'>No Runware API key</p>"
+            else:
+                cell_states[i][0] = "<p style='text-align:center; font-weight:bold;'>준비 중...</p>"
+        elif i == 4:  # SQZB 모델
+            if SKIP_LOCAL_MODELS:
+                cell_states[i][0] = "<p style='color:gray; text-align:center;'>Skipped (--skip-local)</p>"
+            else:
+                cell_states[i][0] = "<p style='text-align:center; font-weight:bold;'>준비 중...</p>"
+        elif i == 5:  # WaveSpeed Fast
+            if not WAVESPEED_API_KEY:
+                cell_states[i][0] = "<p style='color:orange; text-align:center;'>No WaveSpeed API key</p>"
+            else:
+                cell_states[i][0] = "<p style='text-align:center; font-weight:bold;'>준비 중...</p>"
+        elif i == 6:  # WaveSpeed Dev
+            if not WAVESPEED_API_KEY:
+                cell_states[i][0] = "<p style='color:orange; text-align:center;'>No WaveSpeed API key</p>"
+            else:
+                cell_states[i][0] = "<p style='text-align:center; font-weight:bold;'>준비 중...</p>"
+        elif i == 7:  # Empty cell
+            cell_states[i][0] = "<p style='text-align:center;'>Empty cell</p>"
+    
+    # Update UI
+    log_debug("Updating cells to initial states...")
+    try:
+        outputs = yield_ui_update(cell_states)
+        if outputs:
+            log_debug(f"Yielding {len(outputs)} outputs")
+            yield outputs
+            log_debug("Cells updated successfully")
+        else:
+            log_debug("Failed to generate initial UI states")
+            return
+    except Exception as e:
+        log_debug(f"Error updating cells: {str(e)}")
+        log_debug(f"Traceback: {traceback.format_exc()}")
+        return
+    
+    # 각 API 서비스 및 로컬 모델에 대한 작업 시작
+    api_futures = []
+    
+    # 로컬 모델 (vanilla 및 sqzb) 처리
+    local_futures = []
+    if not SKIP_LOCAL_MODELS:
+        log_debug("Starting local model inference...")
+        try:
+            # Vanilla 모델 (right_future)
+            cell_states[0][0] = "<p style='text-align:center; font-weight:bold;'>Waiting...</p>"
+            # SQZB 모델 (left_future)
+            cell_states[4][0] = "<p style='text-align:center; font-weight:bold;'>Waiting...</p>"
+            
+            # UI 업데이트
+            outputs = yield_ui_update(cell_states)
+            if outputs:
+                yield outputs
+                
+            # 로컬 추론 시작 (ProcessPoolExecutor 사용하여 병렬 처리)
+            if not SKIP_LOCAL_MODELS:
+                # Vanilla 모델 (force_no_fp8=True)
+                vanilla_future = _executor.submit(inference_worker, prompt, 0.0, USE_HPU_GRAPHS, shared_seed, force_no_fp8=True)
+                local_futures.append((0, "Vanilla", vanilla_future))
+                
+                # SQZB 모델 (force_no_fp8=False)
+                sqzb_future = _executor.submit(inference_worker, prompt, RDT, USE_HPU_GRAPHS, shared_seed, force_no_fp8=False)
+                local_futures.append((4, "SQZB", sqzb_future))
+        except Exception as e:
+            log_debug(f"Error starting local model inference: {e}")
+            log_debug(f"Traceback: {traceback.format_exc()}")
+    
+    # FAL.ai API
+    if FAL_KEY:
+        log_debug("Starting fal.ai API request")
+        cell_states[1][0] = "<p style='text-align:center; font-weight:bold;'>Waiting...</p>"
+        api_futures.append((1, "fal.ai", "fal"))
+    
+    # Replicate API 
+    if REPLICATE_API_TOKEN:
+        log_debug("Starting Replicate API request")
+        cell_states[2][0] = "<p style='text-align:center; font-weight:bold;'>Waiting...</p>"
+        api_futures.append((2, "Replicate", "replicate"))
+    
+    # Runware API
+    if RUNWARE_API_KEY:
+        log_debug("Starting Runware API request")  
+        cell_states[3][0] = "<p style='text-align:center; font-weight:bold;'>Waiting...</p>"
+        api_futures.append((3, "Runware", "runware"))
+    
+    # WaveSpeed Fast API
+    if WAVESPEED_API_KEY:
+        log_debug("Starting WaveSpeed Fast API request")
+        cell_states[5][0] = "<p style='text-align:center; font-weight:bold;'>Waiting...</p>"
+        api_futures.append((5, "WaveSpeed Fast", "wavespeed_fast"))
+    
+    # WaveSpeed Dev API
+    if WAVESPEED_API_KEY:
+        log_debug("Starting WaveSpeed Dev API request")
+        cell_states[6][0] = "<p style='text-align:center; font-weight:bold;'>Waiting...</p>"
+        api_futures.append((6, "WaveSpeed Dev", "wavespeed_dev"))
+    
+    # UI 업데이트 (API 요청 및 로컬 모델 시작)
+    outputs = yield_ui_update(cell_states)
+    if outputs:
+        yield outputs
+    
+    # 모든 API 요청 병렬로 실행
+    import concurrent.futures
+    import threading
+    
+    active_api_calls = len(api_futures)
+    log_debug(f"Processing {active_api_calls} parallel API requests")
+    
+    # API 요청 비동기 처리를 위한 함수
+    def process_api_request(idx, service_name, api_type):
+        try:
+            log_debug(f"Processing {service_name} request...")
+            img = None
+            elapsed = 0
+            error = None
+            
+            # API 유형에 따라 적절한 함수 호출
+            if api_type == "fal":
+                img, elapsed, error = call_fal_api(prompt, seed=shared_seed)
+            elif api_type == "replicate":
+                img, elapsed, image_url = call_replicate_api(prompt, seed=shared_seed)
+                if img is None:
+                    error = "API call failed to return an image"
+            elif api_type == "runware":
+                img, elapsed = call_runware_api(prompt, seed=shared_seed)
+                if img is None:
+                    error = "API call failed to return an image"
+            elif api_type.startswith("wavespeed"):
+                model_type = "fast" if api_type == "wavespeed_fast" else "dev"
+                img, elapsed = call_wavespeed_api(prompt, model_type=model_type, seed=shared_seed)
+                if img is None:
+                    error = "API call failed to return an image"
+            
+            # 결과 처리
+            if error:
+                log_debug(f"Error from {service_name} API: {error}")
+                return idx, service_name, None, elapsed, error
+            elif img:
+                log_debug(f"{service_name} API call successful in {elapsed:.2f}s")
+                return idx, service_name, img, elapsed, None
+            else:
+                log_debug(f"{service_name} API returned no image")
+                return idx, service_name, None, elapsed, "No image was generated"
+                
+        except Exception as e:
+            log_debug(f"Exception in {service_name} API request: {e}")
+            log_debug(f"Traceback: {traceback.format_exc()}")
+            return idx, service_name, None, 0, str(e)
+    
+    # 스레드풀을 사용해 API 요청 병렬 처리
+    api_results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(api_futures)) as executor:
+        future_to_api = {executor.submit(process_api_request, idx, name, api_type): (idx, name) 
+                         for idx, name, api_type in api_futures}
+        
+        for future in concurrent.futures.as_completed(future_to_api):
+            idx, name = future_to_api[future]
+            try:
+                result = future.result()
+                if result:
+                    api_results.append(result)
+                    # UI 업데이트
+                    cell_idx, service_name, img, elapsed, error = result
+                    if error:
+                        cell_states[cell_idx][0] = f"<p style='color:red; text-align:center; font-size:0.8em;'>{str(error)[:50]}...</p>"
+                    else:
+                        cell_states[cell_idx][0] = f"<p style='color:green; text-align:center;'>Elapsed: {elapsed:.2f}s</p>"
+                        cell_states[cell_idx][2] = img
+                    
+                    # 각 API 결과마다 UI 업데이트
+                    outputs = yield_ui_update(cell_states)
+                    if outputs:
+                        yield outputs
+            except Exception as e:
+                log_debug(f"Error processing {name} API result: {e}")
+                log_debug(f"Traceback: {traceback.format_exc()}")
+                cell_states[idx][0] = f"<p style='color:red; text-align:center;'>{str(e)[:20]}...</p>"
+                outputs = yield_ui_update(cell_states)
+                if outputs:
+                    yield outputs
+    
+    # 로컬 모델 결과 처리
+    if local_futures:
+        log_debug(f"Waiting for {len(local_futures)} local model inference results")
+        
+        for idx, name, future in local_futures:
+            try:
+                cell_states[idx][0] = f"<p style='text-align:center; font-weight:bold;'>Waiting...</p>"
+                outputs = yield_ui_update(cell_states)
+                if outputs:
+                    yield outputs
+                
+                # 결과 대기 (timeout 60초)
+                try:
+                    result = future.result(timeout=60)
+                    images, elapsed, seed = result
+                    
+                    if images:
+                        # 이미지 처리
+                        if isinstance(images, list) and len(images) > 0:
+                            display_image = images[0]
+                        else:
+                            display_image = images
+                        
+                        cell_states[idx][0] = f"<p style='color:green; text-align:center;'>Elapsed: {elapsed:.2f}s</p>"
+                        cell_states[idx][2] = display_image
+                    else:
+                        cell_states[idx][0] = f"<p style='color:orange; text-align:center;'>이미지 없음</p>"
+                    
+                    # UI 업데이트
+                    outputs = yield_ui_update(cell_states)
+                    if outputs:
+                        yield outputs
+                        
+                except concurrent.futures.TimeoutError:
+                    log_debug(f"{name} model inference timed out")
+                    cell_states[idx][0] = f"<p style='color:orange; text-align:center;'>시간 초과</p>"
+                    outputs = yield_ui_update(cell_states)
+                    if outputs:
+                        yield outputs
+                
+            except Exception as e:
+                log_debug(f"Error processing {name} result: {e}")
+                log_debug(f"Traceback: {traceback.format_exc()}")
+                cell_states[idx][0] = f"<p style='color:red; text-align:center;'>오류: {str(e)[:50]}...</p>"
+                outputs = yield_ui_update(cell_states)
+                if outputs:
+                    yield outputs
+    
+    # 최종 UI 업데이트
+    log_debug("Sending final UI update")
+    try:
+        outputs = yield_ui_update(cell_states)
+        if outputs:
+            log_debug(f"Yielding final {len(outputs)} outputs")
+            yield outputs
+            log_debug("Final UI update successful")
+        else:
+            log_debug("Failed to generate final UI outputs")
+    except Exception as e:
+        log_debug(f"Error in final yield: {str(e)}")
+        log_debug(f"Traceback: {traceback.format_exc()}")
+        return
+
+def yield_ui_update(cell_states):
+    """Helper function to yield UI updates from the cell states"""
+    try:
+        outputs = []
+        for i, cell in enumerate(cell_states):
+            outputs.append(cell[0])                     # time_html content
+            outputs.append(cell[1])                     # progress_html
+            
+            # Show image if available
+            if cell[2] is not None:                     # If we have an image
+                outputs.append(gr.update(visible=True, value=cell[2]))
+            else:
+                outputs.append(gr.update(visible=False))
+        
+        log_debug(f"Yielding {len(outputs)} outputs")
+        return outputs  # Return the outputs instead of yielding
+    except Exception as e:
+        log_debug(f"Error creating UI update: {str(e)}")
+        log_debug(f"Traceback: {traceback.format_exc()}")
+        return None
+
 with gr.Blocks(title="Flux Image Generation UI", css=custom_css) as demo:
     # Main title at the top
-    gr.Markdown(f"# Flux.1 [dev] Image Generation Demo ({HEIGHT}x{WIDTH} resolution)", elem_classes=["main-title"])
+    if args.compare:
+        gr.Markdown(f"# Flux.1 API Comparison ({HEIGHT}x{WIDTH} resolution)", elem_classes=["main-title"])
+    else:
+        gr.Markdown(f"# Flux.1 [dev] Image Generation Demo ({HEIGHT}x{WIDTH} resolution)", elem_classes=["main-title"])
     
-    with gr.Row(elem_classes=["contain-row"]):
-        with gr.Column() as left_column:
-            # Left column title
-            gr.Markdown("# Intel Gaudi-2 HPU 🤝 SqueezeBits (optimized)", elem_classes=["title-text"])
-            
-            # Replace gallery with image component for direct full-size display
-            left_image = gr.Image(
-                label="SQZB Result", 
-                visible=False,
-                elem_id="left-image",
-                elem_classes=["large-image"],
-                height=600,
-                show_download_button=True
-            )
-            
-            # 아이콘 대신 프로그레스 바로 변경
-            left_progress_display = gr.HTML(visible=False)
-            
-            # Time text below gallery
-            left_time = gr.HTML("Elapsed: ... seconds", elem_classes=["time-text"])
-            
-        with gr.Column() as right_column:
-            # Right column title
-            gr.Markdown("# Vanilla version (not optimized)", elem_classes=["title-text"])
-            
-            # Replace gallery with image component for direct full-size display
-            right_image = gr.Image(
-                label="Vanilla Result",
-                visible=False,
-                elem_id="right-image",
-                elem_classes=["large-image"],
-                height=600,
-                show_download_button=True
-            )
-            
-            # 아이콘 대신 프로그레스 바로 변경
-            right_progress_display = gr.HTML(visible=False)
-            
-            # Time text below gallery
-            right_time = gr.HTML("Elapsed: ... seconds", elem_classes=["time-text"])
+    if args.compare:
+        # Compare mode layout (2x4 grid)
+        # Row 1: [right_future, fal, replicate, runware]
+        with gr.Row(elem_classes=["contain-row"]) as top_row:
+            with gr.Column(scale=1, elem_classes=["compact-column"]) as col1:
+                with gr.Row(elem_classes=["title-container"]):
+                    gr.Markdown("## Vanilla version", elem_classes=["title-text"], )
+                    top_time1 = gr.HTML("Loading...", elem_classes=["time-text"])
+                top_progress1 = gr.HTML(visible=False)
+                top_image1 = gr.Image(label="Vanilla", visible=False, elem_classes=["large-image"], height=250, width=250)
+                
+            with gr.Column(scale=1, elem_classes=["compact-column"]) as col2:
+                with gr.Row(elem_classes=["title-container"]):
+                    gr.Markdown("## Fal.ai", elem_classes=["title-text"])
+                    top_time2 = gr.HTML("Loading...", elem_classes=["time-text"])
+                top_progress2 = gr.HTML(visible=False)
+                top_image2 = gr.Image(label="Fal.ai", visible=False, elem_classes=["large-image"], height=250, width=250)
+                
+            with gr.Column(scale=1, elem_classes=["compact-column"]) as col3:
+                with gr.Row(elem_classes=["title-container"]):
+                    gr.Markdown("## Replicate", elem_classes=["title-text"])
+                    top_time3 = gr.HTML("Loading...", elem_classes=["time-text"])
+                top_progress3 = gr.HTML(visible=False)
+                top_image3 = gr.Image(label="Replicate", visible=False, elem_classes=["large-image"], height=250, width=250)
+                
+            with gr.Column(scale=1, elem_classes=["compact-column"]) as col4:
+                with gr.Row(elem_classes=["title-container"]):
+                    gr.Markdown("## Runware", elem_classes=["title-text"])
+                    top_time4 = gr.HTML("Loading...", elem_classes=["time-text"])
+                top_progress4 = gr.HTML(visible=False)
+                top_image4 = gr.Image(label="Runware", visible=False, elem_classes=["large-image"], height=250, width=250)
+        
+        # Row 2: [left_future, wavespeed_fast, wavespeed_dev, empty]
+        with gr.Row(elem_classes=["contain-row"]) as bottom_row:
+            with gr.Column(scale=1, elem_classes=["compact-column"]) as col5:
+                with gr.Row(elem_classes=["title-container"]):
+                    gr.Markdown("## SQZB Optimized", elem_classes=["title-text"])
+                    bottom_time1 = gr.HTML("Loading...", elem_classes=["time-text"])
+                bottom_progress1 = gr.HTML(visible=False)
+                bottom_image1 = gr.Image(label="SQZB", visible=False, elem_classes=["large-image"], height=250, width=250)
+                
+            with gr.Column(scale=1, elem_classes=["compact-column"]) as col6:
+                with gr.Row(elem_classes=["title-container"]):
+                    gr.Markdown("## WaveSpeed Fast", elem_classes=["title-text"])
+                    bottom_time2 = gr.HTML("Loading...", elem_classes=["time-text"])
+                bottom_progress2 = gr.HTML(visible=False)
+                bottom_image2 = gr.Image(label="WaveSpeed Fast", visible=False, elem_classes=["large-image"], height=250, width=250)
+                
+            with gr.Column(scale=1, elem_classes=["compact-column"]) as col7:
+                with gr.Row(elem_classes=["title-container"]):
+                    gr.Markdown("## WaveSpeed Dev", elem_classes=["title-text"])
+                    bottom_time3 = gr.HTML("Loading...", elem_classes=["time-text"])
+                bottom_progress3 = gr.HTML(visible=False)
+                bottom_image3 = gr.Image(label="WaveSpeed Dev", visible=False, elem_classes=["large-image"], height=250, width=250)
+                
+            with gr.Column(scale=1, elem_classes=["compact-column"]) as col8:
+                with gr.Row(elem_classes=["title-container"]):
+                    gr.Markdown("## (Empty)", elem_classes=["title-text"])
+                    bottom_time4 = gr.HTML("", elem_classes=["time-text"])
+                bottom_progress4 = gr.HTML(visible=False)
+                bottom_image4 = gr.Image(label="Empty", visible=False, elem_classes=["large-image"], height=250, width=250)
+    else:
+        # Original layout (1x2 grid)
+        with gr.Row(elem_classes=["contain-row"]):
+            with gr.Column() as left_column:
+                # Left column title
+                with gr.Row(elem_classes=["title-container"]):
+                    gr.Markdown("# Intel Gaudi-2 HPU 🤝 SqueezeBits (optimized)", elem_classes=["title-text"])
+                    left_time = gr.HTML("Elapsed: ... seconds", elem_classes=["time-text"])
+                
+                # Replace gallery with image component for direct full-size display
+                left_image = gr.Image(
+                    label="SQZB Result", 
+                    visible=False,
+                    elem_id="left-image",
+                    elem_classes=["large-image"],
+                    height=640,
+                    show_download_button=True
+                )
+                
+                # 아이콘 대신 프로그레스 바로 변경
+                left_progress_display = gr.HTML(visible=False)
+                
+            with gr.Column() as right_column:
+                # Right column title
+                with gr.Row(elem_classes=["title-container"]):
+                    gr.Markdown("# Vanilla version <br>(not optimized)", elem_classes=["title-text"])
+                    right_time = gr.HTML("Elapsed: ... seconds", elem_classes=["time-text"])
+                
+                # Replace gallery with image component for direct full-size display
+                right_image = gr.Image(
+                    label="Vanilla Result",
+                    visible=False,
+                    elem_id="right-image",
+                    elem_classes=["large-image"],
+                    height=640,
+                    show_download_button=True
+                )
+                
+                # 아이콘 대신 프로그레스 바로 변경
+                right_progress_display = gr.HTML(visible=False)
     
     # Move prompt area here - immediately after the galleries
     prompt_box = gr.Textbox(label="Prompt", placeholder="Enter your prompt here", lines=2)
@@ -773,16 +1597,61 @@ with gr.Blocks(title="Flux Image Generation UI", css=custom_css) as demo:
     def on_click_sample_prompt():
         return gr.update(value=random.choice(SAMPLE_PROMPTS))
 
-    submit_btn.click(
-        on_submit_generate,
-        inputs=[prompt_box, seed_input, seed_checkbox],
-        outputs=[left_time, left_progress_display, left_image, right_time, right_progress_display, right_image],
-    )
-    prompt_box.submit(
-        on_submit_generate,
-        inputs=[prompt_box, seed_input, seed_checkbox],
-        outputs=[left_time, left_progress_display, left_image, right_time, right_progress_display, right_image],
-    )
+    if args.compare:
+        # Connect submit button for compare mode
+        compare_outputs = [
+            # Top row outputs
+            top_time1, top_progress1, top_image1,
+            top_time2, top_progress2, top_image2,
+            top_time3, top_progress3, top_image3,
+            top_time4, top_progress4, top_image4,
+            # Bottom row outputs
+            bottom_time1, bottom_progress1, bottom_image1,
+            bottom_time2, bottom_progress2, bottom_image2,
+            bottom_time3, bottom_progress3, bottom_image3,
+            bottom_time4, bottom_progress4, bottom_image4,
+        ]
+        print(f"Setting up compare mode interface with {len(compare_outputs)} outputs")
+        
+        # Special debug message
+        log_debug("COMPARE MODE EVENT HANDLERS SETUP")
+        log_debug(f"Number of outputs: {len(compare_outputs)}")
+        log_debug(f"Using on_submit_generate_compare function")
+        
+        submit_btn.click(
+            fn=on_submit_generate_compare,
+            inputs=[prompt_box, seed_input],
+            outputs=compare_outputs,
+        )
+        
+        prompt_box.submit(
+            fn=on_submit_generate_compare,
+            inputs=[prompt_box, seed_input],
+            outputs=compare_outputs,
+        )
+        
+        log_debug("Event handlers setup complete")
+    else:
+        # Connect submit button for original mode
+        print("Setting up standard mode interface")
+        standard_outputs = [left_time, left_progress_display, left_image, right_time, right_progress_display, right_image]
+        submit_btn.click(
+            on_submit_generate,
+            inputs=[prompt_box, seed_input, seed_checkbox],
+            outputs=standard_outputs,
+        )
+        prompt_box.submit(
+            on_submit_generate,
+            inputs=[prompt_box, seed_input, seed_checkbox],
+            outputs=standard_outputs,
+        )
+    
     sample_prompt_btn.click(fn=on_click_sample_prompt, inputs=None, outputs=prompt_box)
+
+# Launch the app
+if args.compare:
+    print("Starting in API comparison mode with 2x4 grid layout")
+else:
+    print("Starting in standard mode with 1x2 grid layout")
 
 demo.launch(share=True) 
