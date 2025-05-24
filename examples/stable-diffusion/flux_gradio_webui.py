@@ -24,7 +24,7 @@ import io
 # load_dotenv()
 
 FP8 = True
-RDT = 0.15
+RDT = 0.12
 MODEL_PATH = "/workspace/models/FLUX.1-dev"
 IMG_SAVE_PATH = "/workspace/jh/flux/outputs/gradio"
 HEIGHT = 1024
