@@ -41,6 +41,10 @@ from ..pipeline_utils import GaudiDiffusionPipeline
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+# Global flag to enable/disable FBCache analysis data collection
+ENABLE_FB_ANALYSIS = False # Set to True to enable analysis
+output_dir = "/workspace/jh/flux/outputs/analysis"
+
 
 @dataclass
 class GaudiFluxPipelineOutput(BaseOutput):
@@ -341,6 +345,8 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
             This will be faster and save memory compared to fp32/mixed precision but can harm generated images.
         sdp_on_bf16 (bool, defaults to `False`):
             Whether to allow PyTorch to use reduced precision in the SDPA math backend.
+        rdt (float, defaults to -1.0):
+            Residual difference threshold for FBCache analysis.
     """
 
     model_cpu_offload_seq = "text_encoder->text_encoder_2->transformer->vae"
@@ -381,6 +387,7 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
             tokenizer_2=tokenizer_2,
             transformer=transformer,
         )
+        self.rdt = rdt # Store rdt for later checks
 
         for block in self.transformer.single_transformer_blocks:
             block.attn.processor = GaudiFluxAttnProcessor2_0()
@@ -394,7 +401,20 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
         # Capture pipeline instance for closures
         pipeline_self = self
 
-        if use_hpu_graphs and rdt > 0:
+        if use_hpu_graphs and self.rdt > 0:
+            # Initialize analysis data structure if analysis is enabled
+            if ENABLE_FB_ANALYSIS:
+                pipeline_self.fb_analysis_data = {
+                    "timesteps": [],
+                    "first_block_outputs": [],
+                    "total_outputs": [],
+                    "can_use_cache_flags": [],
+                    "first_block_residuals": [],
+                    "mean_diffs": [],
+                    "mean_t1s": [],
+                    "rdt": [],
+                }
+
             # Import FirstBlockWrapper here if not already globally imported in this file
             # from .pipeline_flux import FirstBlockWrapper # Assuming it's defined in the same file or accessible
 
@@ -423,9 +443,14 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
                 # 1) 캐싱 단계 표시 및 스텝 시작
                 mark_step_begin()
                 
+                if ENABLE_FB_ANALYSIS:
+                    # 현재 timestep 저장 (분석용)
+                    current_timestep_val = timestep[0].item() if timestep.ndim > 0 else timestep.item()
+                    pipeline_self.fb_analysis_data["timesteps"].append(current_timestep_val)
+
                 # 2) first_block_graph 실행 (임베딩 + 첫 번째 블록)
                 # 파이프라인 레벨의 first_block_graph 사용 (captured pipeline_self)
-                first_block_outputs = pipeline_self.first_block_hpu_graph_for_cache(
+                first_block_outputs_dict = pipeline_self.first_block_hpu_graph_for_cache(
                     hidden_states=hidden_states,
                     encoder_hidden_states=encoder_hidden_states,
                     pooled_projections=pooled_projections,
@@ -438,23 +463,44 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
                 htcore.mark_step()
                 
                 # 결과 및 중간값 추출
-                first_block_result = first_block_outputs['result'] 
-                hidden_states_embedded = first_block_outputs['hidden_states_embedded']
-                encoder_hidden_states_embedded = first_block_outputs['encoder_hidden_states_embedded']
+                first_block_result = first_block_outputs_dict['result'] 
+                hidden_states_embedded = first_block_outputs_dict['hidden_states_embedded']
+                # encoder_hidden_states_embedded = first_block_outputs_dict['encoder_hidden_states_embedded']
                 
                 if not isinstance(first_block_result, torch.Tensor):
-                    encoder_hidden_states_first, hidden_states_first = first_block_result
+                    # GaudiFluxTransformerBlock returns (encoder_hidden_states, hidden_states)
+                    # We are interested in the hidden_states part from the first block.
+                    _, hidden_states_first = first_block_result
                 else:
+                    # This case might not be hit if FirstBlockWrapper always wraps a FluxTransformerBlock
                     hidden_states_first = first_block_result
+                
+                if ENABLE_FB_ANALYSIS:
+                    # 첫 번째 블록 출력 저장 (분석용)
+                    pipeline_self.fb_analysis_data["first_block_outputs"].append(hidden_states_first.cpu().clone().detach())
                 
                 # 3) 첫 번째 블록 residual 계산
                 first_hidden_states_residual = hidden_states_first - hidden_states_embedded
+                if ENABLE_FB_ANALYSIS:
+                    pipeline_self.fb_analysis_data["first_block_residuals"].append(first_hidden_states_residual.cpu().clone().detach())
                 
                 # 4) 캐시 사용 가능 여부 확인
+                # The underlying transformer module for _is_parallelized might be nested if HPU graph is applied
+                base_transformer_module = transformer_instance_self.module if hasattr(transformer_instance_self, 'module') else transformer_instance_self
                 can_use_cache = get_can_use_cache(
                     first_hidden_states_residual,
-                    parallelized=getattr(transformer_instance_self, "_is_parallelized", False), # Use the HPU graph instance's attribute
-                )
+                    parallelized=getattr(base_transformer_module, "_is_parallelized", False),
+                )[0]
+                # can_use_cache = can_use_cache_diff[0]
+                # mean_diff = can_use_cache_diff[1]
+                # mean_t1 = can_use_cache_diff[2]
+                if timestep[0].item() > 0.82 and timestep[0].item() < 0.84:
+                    can_use_cache = False
+                if ENABLE_FB_ANALYSIS:
+                    pipeline_self.fb_analysis_data["can_use_cache_flags"].append(can_use_cache)
+                    # pipeline_self.fb_analysis_data["mean_diffs"].append(mean_diff)
+                    # pipeline_self.fb_analysis_data["mean_t1s"].append(mean_t1)
+                    # pipeline_self.fb_analysis_data["rdt"].append([self.rdt, mean_diff/mean_t1 if mean_t1 is not None else None])
                 htcore.mark_step()
                 # print(f"can_use_cache: {can_use_cache}")
                 
@@ -489,6 +535,8 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
                     )[0]
                 
                 # 결과 저장
+                if ENABLE_FB_ANALYSIS:
+                    pipeline_self.fb_analysis_data["total_outputs"].append(total_output.cpu().clone().detach())
                 set_buffer("total_output", total_output)
                 
                 htcore.mark_step()
@@ -505,6 +553,18 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
             # 새 forward 함수 연결 (main_transformer_hpu_graph의 forward를 교체)
             main_transformer_hpu_graph.forward = graph_cached_forward.__get__(main_transformer_hpu_graph, type(main_transformer_hpu_graph))
             self.transformer = main_transformer_hpu_graph # Assign the HPU graph wrapped transformer to self.transformer
+            
+            # For FBCache analysis
+            self.fb_analysis_data = {
+                "timesteps": [],
+                "first_block_outputs": [],
+                "total_outputs": [],
+                "can_use_cache_flags": [],
+                "first_block_residuals": [], # FBCache 판단 기준
+                "mean_diffs": [],
+                "mean_t1s": [],
+                "rdt": [],
+            }
         elif use_hpu_graphs:
             # 'transformer' here is the original nn.Module passed to __init__
             self.transformer = wrap_in_hpu_graph(transformer)
@@ -1000,6 +1060,30 @@ class GaudiFluxPipeline(GaudiDiffusionPipeline, FluxPipeline):
 
             finalize_calibration(self.transformer)
             self._has_been_quantized = True
+
+        # Save FBCache analysis data if enabled
+        if ENABLE_FB_ANALYSIS and self.use_hpu_graphs and self.rdt > 0:
+            # Check if fb_analysis_data was initialized (it should be if these conditions are met)
+            if hasattr(self, "fb_analysis_data") and self.fb_analysis_data["timesteps"]: # Ensure data was collected
+                import pickle
+                import os
+                os.makedirs(output_dir, exist_ok=True)
+                analysis_file_path = os.path.join(output_dir, "fb_analysis_data.pkl")
+                with open(analysis_file_path, "wb") as f:
+                    pickle.dump(self.fb_analysis_data, f)
+                logger.info(f"FBCache analysis data saved to {analysis_file_path}")
+                # Optionally clear data after saving to free memory for subsequent calls
+                # self.fb_analysis_data = {
+                #     "timesteps": [],
+                #     "first_block_outputs": [],
+                #     "total_outputs": [],
+                #     "can_use_cache_flags": [],
+                #     "first_block_residuals": [],
+                # }
+            elif hasattr(self, "fb_analysis_data"):
+                 logger.info("FBCache analysis was enabled, but no data was collected (e.g., zero inference steps or not using cached path).")
+            # else:
+            # logger.warning("FBCache analysis enabled, but fb_analysis_data attribute not found. This shouldn't happen if rdt > 0 and use_hpu_graphs.")
 
         ht.hpu.synchronize()
         speed_metrics_prefix = "generation"
